@@ -62,7 +62,7 @@ The main components of NeuralGuard are as follows:
 1. **Clone the Repository**:
    
    ```
-   git clone https://github.com/Adithya235/NeuralGuard.git
+   git clone https://github.com/Adithya2357/NeuralGuard.git
    cd NeuralGuard
    
    ```
