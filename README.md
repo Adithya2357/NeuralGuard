@@ -145,8 +145,6 @@ The main components of NeuralGuard are as follows:
   
   Real-World Data Integration: Integrate real network traffic data for improved model robustness.
   
-  Security: Enable authentication for Elasticsearch, Kafka, and Grafana for secure deployment
-
   
 ### Contributing
 
