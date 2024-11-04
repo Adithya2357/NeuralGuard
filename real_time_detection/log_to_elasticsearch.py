@@ -5,13 +5,6 @@ from datetime import datetime
 es = Elasticsearch([{'host': 'localhost', 'port': 9200, 'scheme': 'http'}])
 
 def log_threat(data, threat_score):
-    """
-    Logs threat data to Elasticsearch.
-    
-    Args:
-        data (dict): Dictionary containing network traffic details.
-        threat_score (float): The threat score calculated by the model.
-    """
     log_entry = {
         'timestamp': datetime.now(),
         'source_ip': data['source_ip'],
