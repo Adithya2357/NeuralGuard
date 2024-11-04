@@ -12,8 +12,7 @@ def generate_traffic_data():
   
     ips = ['192.168.1.10', '192.168.1.20', '10.0.0.3', '10.0.0.8']
     protocols = ['TCP', 'UDP']
-    flags = [0, 1]  # Example: 0 = normal, 1 = potentially suspicious
-
+    flags = [0, 1] 
     
     return {
         'source_ip': random.choice(ips),
