@@ -4,7 +4,7 @@ import numpy as np
 import joblib
 from log_to_elasticsearch import log_threat
 
-print("Loading model...")  # Debugging line
+print("Loading model...") 
 model = joblib.load('/home/kali/Downloads/NeuralGuard/model/saved_models/threat_detection_model.pkl')
 print("Model loaded successfully.")  
 print("Setting up Kafka consumer...") 
