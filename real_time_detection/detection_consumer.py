@@ -18,11 +18,11 @@ consumer = KafkaConsumer(
     value_deserializer= deserialize_message
 )
 print("Kafka consumer set up. Waiting for messages...")  
-
 THREAT_THRESHOLD = 0.5
 
 def process_data(data):
-    protocol_encoded = 1 if data['protocol'] == 'TCP' else 0
+    protocol_encoded = 1 
+    if data['protocol'] == 'TCP' else 0
     input_data = np.array([[protocol_encoded, data['flags']]])
     return input_data
 
