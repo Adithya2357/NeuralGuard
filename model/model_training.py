@@ -4,15 +4,15 @@ import numpy as np
 import joblib
 
 def generate_synthetic_data(num_samples, features):
-    X = np.random.rand(num_samples, features)  
+    x = np.random.rand(num_samples, features)  
     y = np.random.randint(2, size=num_samples)  
-    return X, y
+    return x, y
 
 num_samples = 1000   
 features = 2          
 
-X, y = generate_synthetic_data(num_samples, features)
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+x, y = generate_synthetic_data(num_samples, features)
+X_train, X_test, y_train, y_test = train_test_split(x, y, test_size=0.2)
 
 model = RandomForestClassifier(n_estimators=100)
 model.fit(X_train, y_train)
