@@ -8,10 +8,14 @@ print("Loading model...")
 model = joblib.load('/home/kali/Downloads/NeuralGuard/model/saved_models/threat_detection_model.pkl')
 print("Model loaded successfully.")  
 print("Setting up Kafka consumer...") 
+def deserialize_message(x): 
+    string_value = x.decode('utf-8') 
+    json_value = json.loads(string_value) 
+    return json_value
 consumer = KafkaConsumer(
     'network-traffic',
     bootstrap_servers='localhost:9092',
-    value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+    value_deserializer= deserialize_message
 )
 print("Kafka consumer set up. Waiting for messages...")  
 
