@@ -3,9 +3,12 @@ import json
 import time
 import random
 
+def serialize(value):
+    return json.dumps(value).encode('utf-8')
+
 producer = KafkaProducer(
     bootstrap_servers='localhost:9092',
-    value_serializer=lambda v: json.dumps(v).encode('utf-8')
+    value_serializer=serialize
 )
 
 def generate_traffic_data():
