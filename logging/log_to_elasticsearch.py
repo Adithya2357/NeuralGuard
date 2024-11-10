@@ -1,7 +1,7 @@
 from elasticsearch import Elasticsearch
 from datetime import datetime
 
-# Connect to Elasticsearch (adding the `scheme` parameter)
+
 es = Elasticsearch([{'host': 'localhost', 'port': 9200, 'scheme': 'http'}])
 
 def log_threat(data, threat_score):
