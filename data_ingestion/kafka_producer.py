@@ -30,7 +30,7 @@ def send_traffic():
         entry = generate_traffic_data()
         producer.send('network-traffic', entry)
         print(f"Sent data: {entry}")
-        time.sleep(1)  # Send data every 1 second
+        time.sleep(2)
 
 if __name__ == "__main__":
     send_traffic()
