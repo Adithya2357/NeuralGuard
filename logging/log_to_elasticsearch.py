@@ -1,8 +1,7 @@
 from elasticsearch import Elasticsearch
 from datetime import datetime
 
-
-es = Elasticsearch([{'host': 'localhost', 'port': 9200, 'scheme': 'http'}])
+a = Elasticsearch([{'host': 'localhost', 'port': 9200, 'scheme': 'http'}])
 
 def log_threat(data, threat_score):
     
@@ -14,5 +13,5 @@ def log_threat(data, threat_score):
         'flags': data['flags'],
         'threat_score': threat_score
     }
-    es.index(index='threat-detection', body=log_entry)
+    a.index(index='threat-detection', body=log_entry)
     print("Logged to Elasticsearch:", log_entry)
