@@ -1,36 +1,46 @@
 from kafka import KafkaProducer
+from scapy.all import *  # Import everything from Scapy
 import json
-import time
-import random
 
-def serialize(value):
-    return json.dumps(value).encode('utf-8')
-
+# Kafka Producer Configuration
 producer = KafkaProducer(
     bootstrap_servers='localhost:9092',
-    value_serializer=serialize
+    value_serializer=lambda v: json.dumps(v).encode('utf-8')
 )
 
-def generate_traffic_data():
-  
-    ips = ['192.168.1.10', '192.168.1.20', '10.0.0.3', '10.0.0.8']
-    protocols = ['TCP', 'UDP']
-    flags = [0, 1] 
-    
-    return {
-        'source_ip': random.choice(ips),
-        'destination_ip': random.choice(ips),
-        'protocol': random.choice(protocols),
-        'flags': random.choice(flags)
+# Function to process packets and send to Kafka
+def process_packet(packet):
+    traffic_data = {
+        'protocol': packet.summary(),  # Full packet summary for unknown protocols
+        'length': len(packet)
     }
 
+    if IP in packet:  # If the packet has an IP layer
+        traffic_data.update({
+            'source_ip': packet[IP].src,
+            'destination_ip': packet[IP].dst
+        })
 
-def send_traffic():
-    while True:
-        entry = generate_traffic_data()
-        producer.send('network-traffic', entry)
-        print(f"Sent data: {entry}")
-        time.sleep(2)
+    elif ARP in packet:  # If the packet is ARP
+        traffic_data.update({
+            'source_ip': packet[ARP].psrc,
+            'destination_ip': packet[ARP].pdst
+        })
+
+    else:  # If the packet has no IP or ARP
+        traffic_data.update({
+            'source_ip': "Unknown",
+            'destination_ip': "Unknown"
+        })
+
+    # Send data to Kafka
+    producer.send('network-traffic', traffic_data)
+    print(f"Sent: {traffic_data}")
+
+# Capture live network traffic (all protocols)
+def capture_traffic():
+    print("Capturing live network traffic... Press Ctrl+C to stop.")
+    sniff(prn=process_packet, store=False)  # Capture all packets in real-time
 
 if __name__ == "__main__":
-    send_traffic()
+    capture_traffic()
