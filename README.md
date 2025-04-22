@@ -116,7 +116,7 @@ The main components of NeuralGuard are as follows:
    Run Kafka Consumer (Real-Time Detection):
    
 
-    python3.10 data_ingestion/kafka_producer.py
+    python3.10 real_time_detection/detection_consumer.py
     
 
    View Real-Time Visualization in Grafana:
