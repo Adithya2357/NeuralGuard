@@ -67,7 +67,7 @@ services:
     restart: unless-stopped
 
   elasticsearch:
-    image: elasticsearch:8.19.3
+    image: elasticsearch:8.19.22
     ports:
       - "127.0.0.1:9200:9200"
     environment:
