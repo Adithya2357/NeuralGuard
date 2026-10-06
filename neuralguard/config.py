@@ -2,16 +2,23 @@
 
 Every setting has a sensible local-development default, so the whole stack runs
 out of the box against ``docker compose up``. CLI flags override these values.
+
+Elasticsearch credentials belong in ``NEURALGUARD_ES_USERNAME`` /
+``NEURALGUARD_ES_PASSWORD`` or ``NEURALGUARD_ES_API_KEY``, not in a host URL
+(``https://user:password@host``); a password in a URL is masked wherever NeuralGuard
+shows the URL (see :func:`redact_credentials`), but other tools may print it.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+import re
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 ENV_PREFIX = "NEURALGUARD_"
+_URL_CREDENTIALS = re.compile(r"(?<=://)\S+@")
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
@@ -44,6 +51,12 @@ class Settings:
     threat_threshold: float = 0.5
     window_seconds: float = 10.0
     alert_cooldown_seconds: float = 5.0
+    # Alert only once a (attack type, target) has this many threat detections within
+    # alert_corroboration_seconds; 1 = alert on the first detection.
+    alert_min_hits: int = 3
+    alert_corroboration_seconds: float = 30.0
+    # Live detection rejects records dated further ahead of this host's clock; 0 = no check.
+    max_clock_skew_seconds: float = 300.0
     # Logging
     log_level: str = "INFO"
     log_format: str = "text"
@@ -67,6 +80,19 @@ class Settings:
             raise ConfigError(
                 f"alert_cooldown_seconds must be >= 0, got {self.alert_cooldown_seconds}"
             )
+        if isinstance(self.alert_min_hits, bool) or not isinstance(self.alert_min_hits, int):
+            raise ConfigError(f"alert_min_hits must be an integer, got {self.alert_min_hits!r}")
+        if self.alert_min_hits < 1:
+            raise ConfigError(f"alert_min_hits must be >= 1, got {self.alert_min_hits}")
+        if not 0 < self.alert_corroboration_seconds < float("inf"):  # also rejects NaN
+            raise ConfigError(
+                "alert_corroboration_seconds must be a number > 0, "
+                f"got {self.alert_corroboration_seconds}"
+            )
+        if not 0 <= self.max_clock_skew_seconds < float("inf"):  # also rejects NaN
+            raise ConfigError(
+                f"max_clock_skew_seconds must be a number >= 0, got {self.max_clock_skew_seconds}"
+            )
         if self.log_format not in ("text", "json"):
             raise ConfigError(f"log_format must be 'text' or 'json', got {self.log_format!r}")
         if self.es_api_key and (self.es_username or self.es_password):
@@ -75,14 +101,32 @@ class Settings:
             raise ConfigError("es_username and es_password must be set together")
 
     @property
+    def kafka_endpoints(self) -> tuple[tuple[str, int], ...]:
+        """``(host, port)`` of each Kafka bootstrap server (port 9092 when not given)."""
+        return _endpoints(self.kafka_bootstrap_servers, lambda scheme: 9092)
+
+    @property
+    def es_endpoints(self) -> tuple[tuple[str, int], ...]:
+        """``(host, port)`` of each Elasticsearch host. Without a port: 443 for https (as
+        the client does), else 9200."""
+        return _endpoints(self.es_hosts, lambda scheme: 443 if scheme == "https" else 9200)
+
+    @property
     def kafka_ports(self) -> tuple[int, ...]:
-        """TCP ports of the Kafka bootstrap servers (used to keep the sniffer off them)."""
-        return _ports(self.kafka_bootstrap_servers, default=9092)
+        """TCP ports of the Kafka bootstrap servers, each once."""
+        return tuple(dict.fromkeys(port for _, port in self.kafka_endpoints))
 
     @property
     def es_ports(self) -> tuple[int, ...]:
-        """TCP ports of the Elasticsearch hosts."""
-        return _ports(self.es_hosts, default=9200)
+        """TCP ports of the Elasticsearch hosts, each once."""
+        return tuple(dict.fromkeys(port for _, port in self.es_endpoints))
+
+    def __repr__(self) -> str:
+        # The dataclass repr, except that credentials in an Elasticsearch URL are masked.
+        values = {f.name: getattr(self, f.name) for f in fields(self) if f.repr}
+        values["es_hosts"] = tuple(redact_credentials(host) for host in self.es_hosts)
+        shown = ", ".join(f"{name}={value!r}" for name, value in values.items())
+        return f"{type(self).__name__}({shown})"
 
     def with_overrides(self, **overrides: object) -> Settings:
         """Return a copy with every non-``None`` override applied (CLI flags use this)."""
@@ -105,6 +149,15 @@ class Settings:
                 return float(raw)
             except ValueError:
                 raise ConfigError(f"{ENV_PREFIX}{name} must be a number, got {raw!r}") from None
+
+        def get_int(name: str) -> int | None:
+            raw = get(name)
+            if raw is None:
+                return None
+            try:
+                return int(raw)
+            except ValueError:
+                raise ConfigError(f"{ENV_PREFIX}{name} must be an integer, got {raw!r}") from None
 
         def get_bool(name: str) -> bool | None:
             raw = get(name)
@@ -137,6 +190,9 @@ class Settings:
         values["threat_threshold"] = get_float("THREAT_THRESHOLD")
         values["window_seconds"] = get_float("WINDOW_SECONDS")
         values["alert_cooldown_seconds"] = get_float("ALERT_COOLDOWN_SECONDS")
+        values["alert_min_hits"] = get_int("ALERT_MIN_HITS")
+        values["alert_corroboration_seconds"] = get_float("ALERT_CORROBORATION_SECONDS")
+        values["max_clock_skew_seconds"] = get_float("MAX_CLOCK_SKEW_SECONDS")
         if (raw := get("LOG_LEVEL")) is not None:
             values["log_level"] = raw.upper()
         if (raw := get("LOG_FORMAT")) is not None:
@@ -145,20 +201,31 @@ class Settings:
         return cls().with_overrides(**values)
 
 
-def _ports(addresses: tuple[str, ...], default: int) -> tuple[int, ...]:
-    ports: list[int] = []
+def redact_credentials(text: str) -> str:
+    """``text`` with the ``user:password@`` part of every URL in it masked as ``***@``."""
+    return _URL_CREDENTIALS.sub("***@", text)
+
+
+def _endpoints(
+    addresses: tuple[str, ...], default_port: Callable[[str], int]
+) -> tuple[tuple[str, int], ...]:
+    """``(host, port)`` of ``[scheme://][user:password@]host[:port][/path]`` addresses, each
+    once; ``default_port(scheme)`` gives the port of an address without one."""
+    endpoints: list[tuple[str, int]] = []
     for address in addresses:
-        rest = address.split("://", 1)[-1].split("/", 1)[0]
-        host_port = rest.rsplit("@", 1)[-1]
-        port = default
-        if host_port.startswith("["):  # [IPv6]:port
-            _, _, tail = host_port.partition("]")
+        scheme, separator, rest = address.partition("://")
+        if not separator:
+            scheme, rest = "", address
+        host = rest.split("/", 1)[0].rsplit("@", 1)[-1]
+        port = default_port(scheme.lower())
+        if host.startswith("["):  # [IPv6]:port
+            host, _, tail = host[1:].partition("]")
             if tail.startswith(":") and tail[1:].isdigit():
                 port = int(tail[1:])
-        elif host_port.count(":") == 1:
-            _, _, raw_port = host_port.partition(":")
+        elif host.count(":") == 1:
+            host, _, raw_port = host.partition(":")
             if raw_port.isdigit():
                 port = int(raw_port)
-        if port not in ports:
-            ports.append(port)
-    return tuple(ports)
+        if (host, port) not in endpoints:
+            endpoints.append((host, port))
+    return tuple(endpoints)

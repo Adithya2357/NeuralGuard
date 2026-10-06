@@ -97,8 +97,9 @@ _COOLDOWN_SECONDS = 12.0
 _FLAG_SYN = "S"
 
 # A pending packet: (timestamp, seq, src, dst, protocol, sport, dport, length, ttl,
-# flags, label). ``seq`` makes ordering total and deterministic.
-_Pending = tuple[float, int, Any, Any, str, int, int, int, int, str, str]
+# flags, label, episode, position). ``seq`` makes ordering total and deterministic; see
+# TrafficSimulator.records_with_episodes for the last two.
+_Pending = tuple[float, int, Any, Any, str, int, int, int, int, str, str, int, int]
 
 
 # --------------------------------------------------------------------------- hosts
@@ -213,7 +214,8 @@ class TrafficSimulator:
 
     ``seed``: same seed + same arguments => identical record stream (``None`` = random).
     ``attack_ratio``: approximate fraction of attack records, in ``[0, 1]``.
-    ``start_time``: epoch seconds of the first record (default: now).
+    ``start_time``: epoch seconds of the first record (default: now). It only shifts the
+    timestamps: a seed gives the same records whatever the start time.
     ``attack_types``: which of ``ATTACK_TYPES`` to generate.
     """
 
@@ -235,6 +237,8 @@ class TrafficSimulator:
         self._rng = random.Random(seed)  # noqa: S311  # nosec B311
         self._pending: list[_Pending] = []
         self._seq = 0
+        self._episode = 0  # attack episodes started so far
+        self._position = 0  # packets queued so far in the current episode
         self._normal_count = 0
         self._attack_count = 0
 
@@ -242,13 +246,13 @@ class TrafficSimulator:
         self._normal_scale = _normal_scale(self.attack_ratio)
         self._processes = self._build_processes()
         self._level = 1.0
-        self._level_until = self.start_time
+        self._level_until = 0.0
 
         self._attack_bag: list[str] = []
         self._variant_bags: dict[str, list[tuple[str, ...]]] = {}
         self._attack_generated = 0  # attack records queued so far (emitted or pending)
         self._attack_offset = self._warmup_records()
-        self._attack_not_before = self.start_time
+        self._attack_not_before = 0.0
         self._active_attacks: list[float] = []  # end times of running episodes
         self._reserved: dict[str, float] = {}  # attacker/victim IP -> reserved until
         self._episode_hosts: list[str] = []  # attacker IPs drawn for the current episode
@@ -269,13 +273,25 @@ class TrafficSimulator:
 
         Records come in non-decreasing ``timestamp`` order and are already canonical.
         """
+        return (record for record, _, _ in self.records_with_episodes(count))
+
+    def records_with_episodes(
+        self, count: int | None = None
+    ) -> Iterator[tuple[dict[str, Any], int, int]]:
+        """Like :meth:`records` (the same stream), each record with its attack episode:
+        ``(record, episode, position)``.
+
+        ``episode`` numbers the attack episodes from 1 (0 for normal traffic) and
+        ``position`` is the record's place in its episode, in time order (0 for the
+        episode's first packet, -1 for normal traffic).
+        """
         if count is not None and (
             isinstance(count, bool) or not isinstance(count, int) or count < 0
         ):
             raise ValueError(f"count must be a non-negative integer or None, got {count!r}")
         return self._take(count)
 
-    def _take(self, count: int | None) -> Iterator[dict[str, Any]]:
+    def _take(self, count: int | None) -> Iterator[tuple[dict[str, Any], int, int]]:
         stream = self._stream
         if count is None:
             while True:
@@ -285,21 +301,27 @@ class TrafficSimulator:
 
     # ------------------------------------------------------------------ main loop
 
-    def _generate(self) -> Iterator[dict[str, Any]]:
+    def _generate(self) -> Iterator[tuple[dict[str, Any], int, int]]:
+        # The simulation runs on its own time line, from 0; start_time is only added to the
+        # emitted timestamps. Computed on large epoch values instead, floating-point rounding
+        # would now and then reorder near-simultaneous events, so the same seed would give
+        # a different stream for a different start time.
         pending = self._pending
-        step_start = self.start_time
+        start_time = self.start_time
+        step_start = 0.0
         while True:
             step_end = step_start + _STEP_SECONDS
             self._schedule_attack(step_start)
             self._spawn_normal(step_start, step_end)
             while pending and pending[0][0] < step_end:
-                ts, _, src, dst, proto, sport, dport, length, ttl, flags, label = heappop(pending)
+                (ts, _, src, dst, proto, sport, dport, length, ttl, flags, label, episode,
+                 position) = heappop(pending)  # fmt: skip
                 if label == NORMAL_LABEL:
                     self._normal_count += 1
                 else:
                     self._attack_count += 1
-                yield {
-                    "timestamp": round(ts, 6),
+                record = {
+                    "timestamp": round(start_time + ts, 6),
                     "source_ip": src,
                     "destination_ip": dst,
                     "protocol": proto,
@@ -310,6 +332,7 @@ class TrafficSimulator:
                     "tcp_flags": flags,
                     "label": label,
                 }
+                yield record, episode, position
             step_start = step_end
 
     def _emit(
@@ -326,10 +349,16 @@ class TrafficSimulator:
         label: str = NORMAL_LABEL,
     ) -> None:
         self._seq += 1
+        if label == NORMAL_LABEL:
+            episode, position = 0, -1
+        else:  # attack packets are queued in time order, one episode at a time
+            episode, position = self._episode, self._position
+            self._position += 1
         heappush(
             self._pending,
-            (ts, self._seq, src, dst, proto, sport, dport, length, ttl, flags, label),
-        )
+            (ts, self._seq, src, dst, proto, sport, dport, length, ttl, flags, label, episode,
+             position),
+        )  # fmt: skip
 
     # ------------------------------------------------------------------ attack scheduling
 
@@ -365,6 +394,8 @@ class TrafficSimulator:
         self._reserved = {ip: until for ip, until in self._reserved.items() if until > now}
         target = self._target(kind)
         self._episode_hosts = [target.ip]
+        self._episode += 1
+        self._position = 0
         queued_before = self._seq
         end = self._attackers[kind](start, target.ip)
         size = self._seq - queued_before
@@ -404,7 +435,7 @@ class TrafficSimulator:
             if ip not in self._reserved and ip not in self._episode_hosts:
                 break
         self._episode_hosts.append(ip)
-        return ip, stack, stack.ttl - rng.randint(5, 25) if external else stack.ttl
+        return ip, stack, stack.ttl - self._hops() if external else stack.ttl
 
     def _target(self, kind: str) -> _Host:
         """A LAN victim that no running episode is already attacking."""
@@ -523,11 +554,11 @@ class TrafficSimulator:
         while True:
             yield rng.randint(low, high)
 
-    def _senders(self, count: int) -> list[tuple[int, int]]:
-        """``(syn_length, ttl)`` of the machines sending a flood.
+    def _senders(self, count: int) -> list[tuple[int, int, int]]:
+        """``(syn_length, initial_ttl, hops)`` of the machines sending a flood.
 
         Each runs its own OS (or a packet-crafting tool such as hping3, whose SYNs carry
-        no or minimal options) behind its own number of hops.
+        no or minimal options) behind its own number of hops - none on the LAN.
         """
         rng = self._rng
         senders = []
@@ -538,7 +569,7 @@ class TrafficSimulator:
             else:
                 stack = _LINUX if fingerprint < 0.7 else _WINDOWS
                 length, ttl = stack.syn_len, stack.ttl
-            senders.append((length, ttl - rng.randint(5, 25)))
+            senders.append((length, ttl, self._hops()))
         return senders
 
     def _botnet_size(self) -> int:
@@ -552,14 +583,15 @@ class TrafficSimulator:
         rate = _log_uniform(rng, 80.0, 600.0)
         n = self._flood_records(rate)
         if sources_mode == "spoofed":  # random source IPs, sent by one or more machines
-            senders = self._senders(self._botnet_size())
+            senders = [
+                (length, ttl - hops) for length, ttl, hops in self._senders(self._botnet_size())
+            ]
             sources = None
         else:  # a handful of real hosts, each with its own fingerprint
             hosts = [self._attacker()[0] for _ in range(rng.randint(2, 6))]
-            senders = self._senders(len(hosts))
-            sources = [
-                (ip, length, ttl + (rng.randint(5, 25) if ip.startswith(_LAN) else 0))
-                for ip, (length, ttl) in zip(hosts, senders, strict=True)
+            sources = [  # a LAN host shows its stack's own TTL
+                (ip, length, ttl if ip.startswith(_LAN) else ttl - hops)
+                for ip, (length, ttl, hops) in zip(hosts, self._senders(len(hosts)), strict=True)
             ]
         sports = self._source_ports(_LINUX if rng.random() < 0.6 else _WINDOWS)
         emit = self._emit
@@ -586,7 +618,7 @@ class TrafficSimulator:
             sources = [self._attacker()[::2] for _ in range(int(_log_uniform(rng, 3, 40)))]
         else:  # reflection / amplification off open servers
             sources = [
-                (self._public_ip(), rng.choice((64, 128)) - rng.randint(5, 25))
+                (self._public_ip(), rng.choice((64, 128)) - self._hops())
                 for _ in range(rng.randint(20, 250))
             ]
         if rng.random() < 0.7:
@@ -656,10 +688,15 @@ class TrafficSimulator:
     def _public_ip6(self) -> str:
         return str(ipaddress.IPv6Address((0x20010DB8 << 96) | self._rng.getrandbits(96)))
 
+    def _hops(self) -> int:
+        """Routers between an internet host and the capture point - the same for normal
+        hosts and attackers, so a TTL alone never gives an attacker away."""
+        return self._rng.randint(6, 24)
+
     def _external_host(self, *, ipv6: bool = False) -> _Host:
         rng = self._rng
         stack = _weighted(rng, ((_LINUX, 0.7), (_WINDOWS, 0.2), (_ROUTER, 0.1)))
-        hops = rng.randint(6, 24)
+        hops = self._hops()
         return _Host(
             ip=self._public_ip(),
             stack=stack,
@@ -753,9 +790,7 @@ class TrafficSimulator:
             return rows
         for rate, activity, follows_level in table:
             effective = rate * scale
-            rows.append(
-                [self.start_time + rng.expovariate(effective), effective, activity, follows_level]
-            )
+            rows.append([rng.expovariate(effective), effective, activity, follows_level])
         return rows
 
     def _spawn_normal(self, step_start: float, step_end: float) -> None:
@@ -989,7 +1024,7 @@ class TrafficSimulator:
     def _internet_client(self) -> _Host:
         rng = self._rng
         stack = _weighted(rng, _NAT_STACKS)
-        hops = rng.randint(6, 24)
+        hops = self._hops()
         return _Host(self._public_ip(), stack, stack.ttl - hops, rng.uniform(0.01, 0.2), hops)
 
     def _inbound_web(self, t: float, client: _Host | None = None) -> None:

@@ -140,7 +140,7 @@ class ThreatModel:
         n_jobs: int = -1,
         metadata: dict[str, Any] | None = None,
     ) -> ThreatModel:
-        """Fit a class-balanced random forest on feature matrix ``X`` and labels ``y``.
+        """Fit a random forest on feature matrix ``X`` and labels ``y``.
 
         ``window_seconds`` is the feature window ``X`` was computed with; it is stored so
         live detection uses the same window. ``n_jobs`` only applies to fitting: the
@@ -169,7 +169,12 @@ class ThreatModel:
 
         estimator = RandomForestClassifier(
             n_estimators=n_estimators,
-            class_weight="balanced_subsample",
+            # No class weights. "Balanced" ones gave each attack sample several times the
+            # weight of a normal one, so wherever attack packets look exactly like normal
+            # traffic (an episode's first packets, a new visitor's SYN) the forest sided
+            # with the attack: a steady stream of false alerts on ordinary traffic.
+            # Unweighted it detects as well, even with attacks rare in the training data.
+            class_weight=None,
             min_samples_leaf=2,
             random_state=random_state,
             n_jobs=n_jobs,
@@ -207,6 +212,11 @@ class ThreatModel:
         """Predictions for a 2-D batch of feature vectors, in row order."""
         proba = self._probabilities(_as_matrix(X, len(self.feature_names)))
         return [self._prediction(row) for row in proba]
+
+    def threat_scores(self, X: np.ndarray) -> np.ndarray:
+        """The ``threat_score`` of each row of a 2-D batch of feature vectors."""
+        proba = self._probabilities(_as_matrix(X, len(self.feature_names)))
+        return np.clip(1.0 - proba[:, self._normal_index], 0.0, 1.0)
 
     def predict_one(self, x: np.ndarray) -> Prediction:
         """Prediction for a single 1-D feature vector."""

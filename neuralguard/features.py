@@ -4,9 +4,10 @@ There are two kinds of features:
 
 * **Packet features** describe a single packet (protocol, size, ports, TCP flags).
 * **Window features** describe recent behaviour around it, over a sliding time window:
-  how many packets this source sent, how many distinct ports/hosts it touched, how
-  many distinct sources are hitting this destination, and so on. These are what make
-  port scans and floods visible - a single scan packet looks perfectly innocent.
+  how many packets this source sent, how many distinct ports/hosts it touched (and how
+  many ports of this packet's destination), how many distinct sources are hitting this
+  destination, and so on. These are what make port scans and floods visible - a single
+  scan packet looks perfectly innocent.
 
 The same :class:`FeatureExtractor` is used for training and for live detection, so
 the model always sees features computed exactly the same way (no train/serve skew).
@@ -15,14 +16,27 @@ Records must be fed in time order; the extractor is stateful.
 
 from __future__ import annotations
 
+import logging
 from collections import Counter, OrderedDict, deque
 from collections.abc import Iterable, Mapping
 from typing import Any
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_WINDOW_SECONDS = 10.0
 DEFAULT_MAX_TRACKED_HOSTS = 50_000
+# Records this far behind the extractor's clock - at least a minute and six windows, far
+# more than packets of different Kafka partitions interleave - mean time itself jumped: a
+# replayed capture, a host clock stepped back, or an earlier record dated in the future.
+# Once DISCONTINUITY_RECORDS of them arrive in a row the windows restart at the new time; a
+# single stray old record is only treated as out of order.
+MIN_DISCONTINUITY_SECONDS = 60.0
+DISCONTINUITY_RECORDS = 20
+# Most packets one host's window keeps, a memory bound for extreme packet rates: counts
+# saturate there, far beyond any attack the model was trained on (~6k per window).
+MAX_WINDOW_EVENTS = 100_000
 
 TCP_FLAG_FEATURES = (
     ("S", "flag_syn"),
@@ -53,6 +67,10 @@ WINDOW_FEATURES = (
     "src_syn_ratio",
     "dst_packet_count",
     "dst_unique_src_ips",
+    # Distinct ports this source sent to this packet's destination: one host hammering
+    # hundreds of ports of one target (a single-source UDP flood, a scan) looks unlike
+    # any fan-out to many hosts, which spreads its ports over the destinations.
+    "pair_unique_dst_ports",
 )
 
 FEATURE_NAMES: tuple[str, ...] = (*PACKET_FEATURES, *WINDOW_FEATURES)
@@ -86,18 +104,20 @@ def packet_features(record: Mapping[str, Any]) -> list[float]:
 class _SourceWindow:
     """Recent packets sent *by* one host."""
 
-    __slots__ = ("dst_ips", "dst_ports", "events", "syn_count")
+    __slots__ = ("dst_ips", "dst_ports", "events", "pair_ports", "syn_count")
 
     def __init__(self) -> None:
         self.events: deque[tuple[float, int, str | None, bool]] = deque()
         self.dst_ports: Counter[int] = Counter()
         self.dst_ips: Counter[str | None] = Counter()
+        self.pair_ports: dict[str | None, Counter[int]] = {}  # ports per destination
         self.syn_count = 0
 
     def add(self, ts: float, dst_port: int, dst_ip: str | None, syn: bool) -> None:
         self.events.append((ts, dst_port, dst_ip, syn))
         self.dst_ports[dst_port] += 1
         self.dst_ips[dst_ip] += 1
+        self.pair_ports.setdefault(dst_ip, Counter())[dst_port] += 1
         self.syn_count += syn
 
     def evict(self, cutoff: float) -> None:
@@ -106,6 +126,10 @@ class _SourceWindow:
             _, dst_port, dst_ip, syn = events.popleft()
             _decrement(self.dst_ports, dst_port)
             _decrement(self.dst_ips, dst_ip)
+            ports = self.pair_ports[dst_ip]
+            _decrement(ports, dst_port)
+            if not ports:
+                del self.pair_ports[dst_ip]
             self.syn_count -= syn
 
 
@@ -138,13 +162,18 @@ def _decrement(counter: Counter, key: Any) -> None:
 class FeatureExtractor:
     """Stateful sliding-window feature extractor.
 
-    ``window_seconds`` is the look-back window. ``max_tracked_hosts`` bounds memory:
-    with spoofed-source floods every packet can come from a new IP, so the least
-    recently seen hosts are forgotten once the limit is hit.
+    ``window_seconds`` is the look-back window. A host is forgotten as soon as its whole
+    window has expired, and ``max_tracked_hosts`` bounds memory beyond that: with
+    spoofed-source floods every packet can come from a new IP, so the least recently
+    seen hosts are forgotten once the limit is hit.
 
     Time is driven by record timestamps (not the wall clock), so results are
     deterministic and identical between training and live detection. A record that
     arrives out of order is treated as if it happened at the latest time seen so far.
+    When ``DISCONTINUITY_RECORDS`` records in a row are more than
+    ``discontinuity_seconds`` behind that time (a replayed capture, a clock stepped back,
+    an earlier record dated in the future), the window state is dropped and the windows
+    restart at the new time; clamping them all would freeze every window for good.
     """
 
     def __init__(
@@ -158,10 +187,12 @@ class FeatureExtractor:
             raise ValueError(f"max_tracked_hosts must be >= 1, got {max_tracked_hosts}")
         self.window_seconds = float(window_seconds)
         self.max_tracked_hosts = int(max_tracked_hosts)
+        self.discontinuity_seconds = max(MIN_DISCONTINUITY_SECONDS, 6.0 * self.window_seconds)
         self.reset()
 
     def reset(self) -> None:
         self._clock = float("-inf")
+        self._behind = 0  # consecutive records far behind the clock
         self._sources: OrderedDict[str | None, _SourceWindow] = OrderedDict()
         self._destinations: OrderedDict[str | None, _DestinationWindow] = OrderedDict()
 
@@ -175,7 +206,21 @@ class FeatureExtractor:
         Updates the window state *before* computing window features, so every count
         includes the current packet.
         """
-        ts = max(float(record["timestamp"]), self._clock)
+        timestamp = float(record["timestamp"])
+        if timestamp < self._clock - self.discontinuity_seconds:
+            self._behind += 1
+            if self._behind >= DISCONTINUITY_RECORDS:
+                logger.warning(
+                    "time went back %.0f s for %d records in a row (a replayed capture, a "
+                    "clock stepped back or an earlier record dated in the future): the "
+                    "sliding windows start afresh",
+                    self._clock - timestamp,
+                    self._behind,
+                )
+                self.reset()
+        else:
+            self._behind = 0
+        ts = max(timestamp, self._clock)
         self._clock = ts
         cutoff = ts - self.window_seconds
         src_ip = record["source_ip"]
@@ -183,11 +228,17 @@ class FeatureExtractor:
 
         source = self._touch(self._sources, src_ip, _SourceWindow)
         source.evict(cutoff)
+        if len(source.events) >= MAX_WINDOW_EVENTS:
+            source.evict(source.events[0][0])
         source.add(ts, record["destination_port"], dst_ip, is_pure_syn(record))
 
         destination = self._touch(self._destinations, dst_ip, _DestinationWindow)
         destination.evict(cutoff)
+        if len(destination.events) >= MAX_WINDOW_EVENTS:
+            destination.evict(destination.events[0][0])
         destination.add(ts, src_ip)
+        _forget_idle(self._sources, cutoff)
+        _forget_idle(self._destinations, cutoff)
 
         src_count = len(source.events)
         window = [
@@ -197,6 +248,7 @@ class FeatureExtractor:
             source.syn_count / src_count,
             float(len(destination.events)),
             float(len(destination.src_ips)),
+            float(len(source.pair_ports[dst_ip])),
         ]
         return np.asarray(packet_features(record) + window, dtype=np.float64)
 
@@ -217,6 +269,22 @@ class FeatureExtractor:
         else:
             table.move_to_end(key)
         return window
+
+
+def _forget_idle(table: OrderedDict, cutoff: float) -> None:
+    """Drop the hosts whose whole window has expired.
+
+    Otherwise a host that went quiet keeps its last window until it is seen again or
+    pushed out by ``max_tracked_hosts`` - with spoofed sources each sending a burst, that
+    is the full history of tens of thousands of hosts. Every touch happens at the
+    (monotonic) clock and moves the host to the end of its table, so the expired hosts
+    are always the ones at the front; dropping one is the same as evicting all its events.
+    """
+    while table:
+        events = next(iter(table.values())).events
+        if events and events[-1][0] > cutoff:
+            return
+        table.popitem(last=False)
 
 
 def features_as_dict(vector: np.ndarray) -> dict[str, float]:

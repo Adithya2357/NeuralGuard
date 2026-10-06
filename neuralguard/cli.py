@@ -13,9 +13,9 @@ Commands:
 
 Settings come from ``NEURALGUARD_*`` environment variables (see :mod:`neuralguard.config`);
 command-line flags override them. Errors in user input print one ``error: ...`` line to
-stderr and exit with status 2 (1 for an unavailable service or an I/O error, 130 for
-Ctrl+C). Heavy dependencies (scikit-learn, scapy, kafka, elasticsearch) are imported
-inside the commands, so ``neuralguard --help`` stays fast.
+stderr and exit with status 2 (1 for an unavailable service, an I/O error or a live
+capture that stopped, 130 for Ctrl+C). Heavy dependencies (scikit-learn, scapy, kafka,
+elasticsearch) are imported inside the commands, so ``neuralguard --help`` stays fast.
 """
 
 from __future__ import annotations
@@ -27,8 +27,10 @@ import json
 import logging
 import math
 import os
+import secrets
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,15 +49,20 @@ EXIT_FAILURE = 1
 EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130
 
+# `neuralguard train`'s simulated training records: four independent 60k-record streams
+# (neuralguard.train.DEFAULT_SAMPLES, repeated so that --help need not import numpy).
+TRAIN_SAMPLES = 240_000
 # The demo's default stream: long enough that seed 7 shows an episode of every attack
 # type (the simulator cycles through all of them; see tests/test_cli.py).
 DEMO_COUNT = 6000
 DEMO_SEED = 7
 # The fallback in-memory model sees as much simulated traffic as `neuralguard train`
-# (with fewer trees): about 20k records cover only ~4 episodes per attack type, too few
-# to have seen every variant, and whole unseen variants then go undetected.
-DEMO_TRAIN_SAMPLES = 60_000
+# (with fewer trees): fewer records cover too few episodes to have seen every attack
+# variant, and whole unseen variants then go undetected. Its seed is never the demo
+# stream's: scored on its own training traffic, a model looks flawless.
+DEMO_TRAIN_SAMPLES = TRAIN_SAMPLES
 DEMO_TRAIN_TREES = 100
+DEMO_TRAIN_SEED = 42
 _DEMO_BATCH_SIZE = 500
 
 # Errors from these classes are reported as one line instead of a traceback. They are
@@ -63,7 +70,9 @@ _DEMO_BATCH_SIZE = 500
 # instance of a loaded class, and importing scikit-learn or kafka just to check would
 # slow down every error path.
 _USAGE_ERRORS = (("neuralguard.model", "ModelError"), ("neuralguard.capture", "CaptureError"))
-_SERVICE_ERRORS = (("kafka.errors", "KafkaError"),)
+# Checked first: a live capture that stopped while running is a CaptureError too, but a
+# failure at run time (status 1, so restart-on-failure supervisors restart it).
+_SERVICE_ERRORS = (("kafka.errors", "KafkaError"), ("neuralguard.capture", "CaptureStoppedError"))
 
 
 # --------------------------------------------------------------------------- parser
@@ -107,9 +116,10 @@ def _add_train(commands: Any) -> None:
     sub.add_argument(
         "--samples",
         type=_positive_int,
-        default=60_000,
+        default=TRAIN_SAMPLES,
         metavar="N",
-        help="simulated training records (default: %(default)s)",
+        help="simulated training records, in independent streams of up to 60000 "
+        "(default: %(default)s)",
     )
     sub.add_argument("--seed", type=int, default=42, help="random seed (default: %(default)s)")
     sub.add_argument(
@@ -184,7 +194,10 @@ def _add_produce(commands: Any) -> None:
         help="fraction of attack traffic, 0-1 (default: %(default)s)",
     )
     sim.add_argument(
-        "--no-pace", action="store_true", help="send as fast as possible instead of in real time"
+        "--no-pace",
+        action="store_true",
+        help="send as fast as possible instead of in real time (with --count, the records "
+        "are dated so that the last one is now)",
     )
     live = sub.add_argument_group("live options (need root or CAP_NET_RAW)")
     live.add_argument("--interface", metavar="IFACE", help="interface to sniff (default: scapy's)")
@@ -229,6 +242,13 @@ def _add_detect(commands: Any) -> None:
         default=0,
         metavar="N",
         help="stop after N messages; 0 = run until stopped (default: %(default)s)",
+    )
+    sub.add_argument(
+        "--max-clock-skew",
+        type=_finite_float,
+        metavar="SECONDS",
+        help="reject records dated more than this far ahead of this host's clock; 0 = no "
+        "check (default: $NEURALGUARD_MAX_CLOCK_SKEW_SECONDS or 300)",
     )
     _add_kafka_options(sub)
     sub.add_argument(
@@ -296,6 +316,21 @@ def _add_detection_options(sub: Any) -> None:
         help="alert cooldown per (attack type, target); 0 disables throttling "
         "(default: $NEURALGUARD_ALERT_COOLDOWN_SECONDS or 5)",
     )
+    sub.add_argument(
+        "--min-hits",
+        type=_positive_int,
+        metavar="N",
+        help="alert only after N threat detections of the same (attack type, target) "
+        "within the corroboration window; 1 = alert on the first "
+        "(default: $NEURALGUARD_ALERT_MIN_HITS or 3)",
+    )
+    sub.add_argument(
+        "--corroboration-window",
+        type=_finite_float,
+        metavar="SECONDS",
+        help="time window for --min-hits "
+        "(default: $NEURALGUARD_ALERT_CORROBORATION_SECONDS or 30)",
+    )
 
 
 def _add_kafka_options(group: Any) -> None:
@@ -334,9 +369,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         _silence_stdout()
         return EXIT_FAILURE
     except Exception as exc:
+        if isinstance(exc, _loaded(_SERVICE_ERRORS)):
+            return _fail(exc, EXIT_FAILURE)
         if isinstance(exc, (ValueError, *_loaded(_USAGE_ERRORS))):
             return _fail(exc, EXIT_USAGE)
-        if isinstance(exc, (OSError, *_loaded(_SERVICE_ERRORS))):
+        if isinstance(exc, OSError):
             return _fail(exc, EXIT_FAILURE)
         raise
 
@@ -440,6 +477,8 @@ def _cmd_produce(args: argparse.Namespace, settings: Settings) -> int:
         kafka_bootstrap_servers=_csv(args.bootstrap_servers), kafka_topic=args.topic
     )
     stop_event = threading.Event()
+    # Before anything that can wait (for Kafka, say): docker stop must work at once.
+    install_signal_handlers(stop_event)
     # The source first: a bad --pcap must fail before --output is truncated (or before
     # waiting for Kafka). Live capture only starts sniffing once iterated.
     records = _record_source(args, settings, stop_event)
@@ -447,15 +486,24 @@ def _cmd_produce(args: argparse.Namespace, settings: Settings) -> int:
         sink: Any = JsonlRecordSink(args.output)
         destination = "stdout" if args.output == "-" else args.output
     else:
-        sink = KafkaRecordSink(create_kafka_producer(settings), settings.kafka_topic)
+        producer = create_kafka_producer(settings, stop_event=stop_event)
+        if producer is None:  # stopped while waiting for Kafka
+            return EXIT_OK
+        sink = KafkaRecordSink(producer, settings.kafka_topic)
         destination = f"Kafka topic {settings.kafka_topic!r}"
+    aborted = False
     try:
-        install_signal_handlers(stop_event)
         pace = args.source == "simulate" and not args.no_pace
         logger.info("publishing %s records to %s", args.source, destination)
         sent = publish(records, sink, pace=pace, stop_event=stop_event)
+    except KeyboardInterrupt:  # Ctrl+C again, e.g. while flushing to an unreachable Kafka
+        aborted = True
+        raise
     finally:
-        _close_quietly(sink)
+        if aborted and isinstance(sink, KafkaRecordSink):
+            _close_quietly(sink, timeout=0)  # do not wait for the broker once more
+        else:
+            _close_quietly(sink)
     logger.info("published %d records to %s", sent, destination)
     return EXIT_OK
 
@@ -481,16 +529,21 @@ def _record_source(
     if args.source == "simulate":
         from neuralguard.simulator import TrafficSimulator
 
-        simulator = TrafficSimulator(seed=args.seed, attack_ratio=args.attack_ratio)
+        seed, start_time = args.seed, None  # None: the simulated stream starts now
+        if args.no_pace:
+            seed, start_time = _unpaced_start(args.seed, args.attack_ratio, limit)
+        simulator = TrafficSimulator(
+            seed=seed, attack_ratio=args.attack_ratio, start_time=start_time
+        )
         return simulator.records(limit)
     from neuralguard import capture
 
     if args.source == "live":
         if args.bpf_filter is None:  # default: keep NeuralGuard's own traffic out
-            bpf_filter, excluded = None, capture.default_excluded_ports(settings)
-            what = "excluding TCP ports " + ", ".join(map(str, excluded))
+            bpf_filter, excluded = None, capture.default_exclusions(settings)
+            what = f"excluding its own connections (TCP {excluded.describe()})"
         else:  # a filter of the user's own ('' = capture everything)
-            bpf_filter, excluded = args.bpf_filter or None, ()
+            bpf_filter, excluded = args.bpf_filter or None, capture.Exclusions()
             what = f"with filter {bpf_filter!r}" if bpf_filter else "without a filter"
         logger.info("capturing on %s %s", args.interface or "the default interface", what)
         return capture.live_records(
@@ -498,18 +551,55 @@ def _record_source(
             bpf_filter=bpf_filter,
             count=args.count,
             stop_event=stop_event,
-            exclude_tcp_ports=excluded,
+            exclude_tcp_endpoints=excluded.endpoints,
+            exclude_tcp_ports=excluded.ports,
         )
     return itertools.islice(capture.pcap_records(args.pcap), limit)
 
 
+def _unpaced_start(
+    seed: int | None, attack_ratio: float, limit: int | None
+) -> tuple[int | None, float | None]:
+    """Seed and start time for simulated traffic sent as fast as possible.
+
+    Generated much faster than real time, a stream starting now soon runs ahead of the
+    clock, and a detector rejects records dated too far in the future. With a record
+    limit the stream is started as long ago as it lasts (measured on the very same
+    seeded stream, which is cheap), so its last record is dated now.
+    """
+    from neuralguard.simulator import TrafficSimulator
+
+    if limit is None:
+        logger.warning(
+            "unpaced simulated traffic without --count runs ahead of the clock: a detector "
+            "rejects records dated more than its max clock skew in the future "
+            "(NEURALGUARD_MAX_CLOCK_SKEW_SECONDS, 300 s by default; 0 turns the check off)"
+        )
+        return seed, None
+    if seed is None:
+        seed = secrets.randbits(32)  # both passes must generate the same stream
+    now = time.time()
+    last = now
+    for record in TrafficSimulator(seed=seed, attack_ratio=attack_ratio, start_time=now).records(
+        limit
+    ):
+        last = record["timestamp"]
+    return seed, max(0.0, now - (last - now))
+
+
 def _cmd_detect(args: argparse.Namespace, settings: Settings) -> int:
-    from neuralguard.alerts import AlertThrottler
     from neuralguard.consumer import (
         DetectionService,
         create_kafka_consumer,
         install_signal_handlers,
     )
+
+    # First of all: docker stop must also work while the model loads and while Kafka
+    # cannot be reached yet, not only once the service runs.
+    stop_event = threading.Event()
+    install_signal_handlers(stop_event)
+
+    from neuralguard.alerts import AlertThrottler
     from neuralguard.detector import Detector
     from neuralguard.model import ThreatModel
     from neuralguard.sinks import ConsoleSink, ElasticsearchSink, JsonlSink
@@ -518,13 +608,20 @@ def _cmd_detect(args: argparse.Namespace, settings: Settings) -> int:
         model_path=args.model,
         threat_threshold=args.threshold,
         alert_cooldown_seconds=args.cooldown,
+        alert_min_hits=args.min_hits,
+        alert_corroboration_seconds=args.corroboration_window,
         kafka_bootstrap_servers=_csv(args.bootstrap_servers),
         kafka_topic=args.topic,
         es_hosts=_csv(args.es_hosts),
+        max_clock_skew_seconds=args.max_clock_skew,
     )
     model = ThreatModel.load(settings.model_path)
-    detector = Detector(model, threshold=settings.threat_threshold)
-    throttler = AlertThrottler(settings.alert_cooldown_seconds)
+    detector = Detector(
+        model,
+        threshold=settings.threat_threshold,
+        max_future_skew=settings.max_clock_skew_seconds or None,  # 0 = no check
+    )
+    throttler = AlertThrottler.from_settings(settings)
 
     sinks: list[Any] = [ConsoleSink()]
     try:
@@ -532,24 +629,29 @@ def _cmd_detect(args: argparse.Namespace, settings: Settings) -> int:
             sinks.append(ElasticsearchSink.from_settings(settings))
         if args.alerts_file is not None:
             sinks.append(JsonlSink(args.alerts_file))
-        consumer = create_kafka_consumer(settings)
+        consumer = create_kafka_consumer(settings, stop_event=stop_event)
     except BaseException:
         for sink in sinks:
             _close_quietly(sink)
         raise
+    if consumer is None:  # stopped while waiting for Kafka
+        for sink in sinks:
+            _close_quietly(sink)
+        return EXIT_OK
 
     logger.info(
         "detector starting: model %s, threshold %.2f, window %.1fs, cooldown %.1fs, "
-        "topic %r, alerts to %s",
+        "alert after %d hit(s) in %gs, max clock skew %s, topic %r, alerts to %s",
         model.version,
         detector.threshold,
         model.window_seconds,
         throttler.cooldown_seconds,
+        throttler.min_hits,
+        throttler.corroboration_seconds,
+        "off" if detector.max_future_skew is None else f"{detector.max_future_skew:g}s",
         settings.kafka_topic,
         ", ".join(_sink_name(sink) for sink in sinks),
     )
-    stop_event = threading.Event()
-    install_signal_handlers(stop_event)
     service = DetectionService(detector, sinks, throttler=throttler, model_version=model.version)
     stats = service.run(consumer, stop_event=stop_event, max_messages=args.max_messages or None)
     logger.info(
@@ -573,10 +675,13 @@ def _cmd_demo(args: argparse.Namespace, settings: Settings) -> int:
         model_path=args.model,
         threat_threshold=args.threshold,
         alert_cooldown_seconds=args.cooldown,
+        alert_min_hits=args.min_hits,
+        alert_corroboration_seconds=args.corroboration_window,
     )
-    model, source = _demo_model(settings, args.train_samples, args.train_trees)
+    model, source = _demo_model(settings, args.train_samples, args.train_trees, args.seed)
+    _warn_about_training_traffic(model, args.seed, args.attack_ratio)
     detector = Detector(model, threshold=settings.threat_threshold)
-    throttler = AlertThrottler(settings.alert_cooldown_seconds)
+    throttler = AlertThrottler.from_settings(settings)
     console = ConsoleSink()
     service = DetectionService(
         detector, [console], throttler=throttler, model_version=model.version
@@ -602,6 +707,7 @@ def _cmd_demo(args: argparse.Namespace, settings: Settings) -> int:
         _close_quietly(console)
     summary.alerts_emitted = service.alerts_emitted
     summary.alerts_suppressed = throttler.suppressed_total
+    summary.alerts_uncorroborated = throttler.uncorroborated_total + throttler.pending
     summary.invalid = detector.stats.invalid
 
     print()
@@ -614,27 +720,53 @@ def _cmd_demo(args: argparse.Namespace, settings: Settings) -> int:
     return EXIT_OK
 
 
-def _demo_model(settings: Settings, n_samples: int, n_trees: int) -> tuple[Any, str]:
-    """The saved model, or - when the file does not exist - a small one trained now."""
+def _demo_model(
+    settings: Settings, n_samples: int, n_trees: int, demo_seed: int
+) -> tuple[Any, str]:
+    """The saved model, or - when the file does not exist - a small one trained now, on
+    simulated streams other than the demo's (``demo_seed``)."""
     from neuralguard.model import ThreatModel
 
     path = settings.model_path
     if path.exists():
         return ThreatModel.load(path), f"loaded from {path}"
 
-    from neuralguard.train import train_model
+    from neuralguard.train import simulated_plan, train_model
 
+    seed = DEMO_TRAIN_SEED
+    while any(stream_seed == demo_seed for stream_seed, _ in simulated_plan(n_samples, seed)[0]):
+        seed += 1
     logger.info(
-        "model file %s not found; training a small in-memory model (%d samples, %d trees) - "
-        "run 'neuralguard train' to create a proper one",
+        "model file %s not found; training a small in-memory model (%d samples, %d trees, "
+        "seed %d) - run 'neuralguard train' to create a proper one",
         path,
         n_samples,
         n_trees,
+        seed,
     )
     result = train_model(
-        n_samples=n_samples, n_estimators=n_trees, window_seconds=settings.window_seconds
+        n_samples=n_samples,
+        n_estimators=n_trees,
+        seed=seed,
+        window_seconds=settings.window_seconds,
     )
     return result.model, "trained in memory"
+
+
+def _warn_about_training_traffic(model: Any, seed: int, attack_ratio: float) -> None:
+    """Warn when the demo's stream is one the model was trained on: its numbers would
+    say nothing about how the model does on traffic it has not seen."""
+    training = getattr(model, "metadata", {}).get("training")
+    if not isinstance(training, dict) or training.get("source") != "simulated":
+        return
+    seeds = training.get("seeds") or [training.get("seed")]
+    if seed in seeds and training.get("attack_ratio") == attack_ratio:
+        logger.warning(
+            "the demo stream (seed %d, attack ratio %g) is the model's own training "
+            "traffic, so its detection rate is flattering; use another --seed",
+            seed,
+            attack_ratio,
+        )
 
 
 # --------------------------------------------------------------------- demo summary
@@ -654,6 +786,7 @@ class DemoSummary:
     by_label: dict[str, _LabelCounts] = field(default_factory=dict)
     alerts_emitted: int = 0
     alerts_suppressed: int = 0
+    alerts_uncorroborated: int = 0
     invalid: int = 0
 
     def add(self, detections: Iterable[Any]) -> None:
@@ -703,6 +836,7 @@ class DemoSummary:
             ("False-positive rate (normal packets flagged)", _rate(normal_flagged, normal)),
             ("Alerts emitted", str(self.alerts_emitted)),
             ("Alerts suppressed by throttling", str(self.alerts_suppressed)),
+            ("Lone detections not corroborated", str(self.alerts_uncorroborated)),
         ]
         if self.invalid:
             overall.append(("Invalid records skipped", str(self.invalid)))
@@ -758,9 +892,9 @@ def _csv(value: str | None) -> tuple[str, ...] | None:
     return tuple(part.strip() for part in value.split(",") if part.strip())
 
 
-def _close_quietly(resource: Any) -> None:
+def _close_quietly(resource: Any, **kwargs: Any) -> None:
     try:
-        resource.close()
+        resource.close(**kwargs)
     except Exception:
         logger.exception("error while closing %s", type(resource).__name__)
 

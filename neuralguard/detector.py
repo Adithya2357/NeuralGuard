@@ -22,7 +22,9 @@ model runs once for the whole batch - much faster than one call per packet.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Mapping
+import math
+import time
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -87,6 +89,12 @@ class Detector:
     ``threshold`` must be in (0, 1]. When ``extractor`` is ``None`` a fresh
     ``FeatureExtractor(window_seconds=model.window_seconds)`` is used. Records must be
     fed in time order (the extractor keeps sliding-window state). Not thread-safe.
+
+    ``max_future_skew`` (seconds, ``None`` = no check) rejects, as invalid, records
+    dated further ahead of ``clock()`` (epoch seconds, default ``time.time``) than that.
+    Live detection needs it: the extractor's clock only moves forward, so a single
+    record dated, say, a year ahead would otherwise stop every sliding window for good.
+    Leave it off for simulated traffic, whose time is unrelated to the wall clock.
     """
 
     def __init__(
@@ -95,9 +103,15 @@ class Detector:
         *,
         threshold: float = 0.5,
         extractor: FeatureExtractor | None = None,
+        max_future_skew: float | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         if not 0.0 < threshold <= 1.0:
             raise ValueError(f"threshold must be in (0, 1], got {threshold}")
+        if max_future_skew is not None and not (
+            math.isfinite(max_future_skew) and max_future_skew >= 0
+        ):
+            raise ValueError(f"max_future_skew must be a number >= 0, got {max_future_skew}")
         self.model = model
         self.threshold = float(threshold)
         self.extractor = (
@@ -105,6 +119,8 @@ class Detector:
             if extractor is None
             else extractor
         )
+        self.max_future_skew = None if max_future_skew is None else float(max_future_skew)
+        self._clock = clock
         self.stats = DetectorStats()
 
     def process(self, raw: Mapping[str, Any]) -> Detection:
@@ -114,7 +130,7 @@ class Detector:
         (after counting it in ``stats.invalid``).
         """
         try:
-            record = normalize_record(raw)
+            record = self._normalize(raw)
         except InvalidRecordError:
             self.stats.invalid += 1
             raise
@@ -126,14 +142,18 @@ class Detector:
         """Detect on a batch of raw records, in input order.
 
         Invalid records are skipped: logged at WARNING with the reason and counted in
-        ``stats.invalid``. The model is called once, with every valid record's features.
+        ``stats.invalid`` - also one that fails validation in an unexpected way, so a
+        single malformed record never aborts the batch. The model is called once, with
+        every valid record's features.
         """
         records: list[dict[str, Any]] = []
         rows: list[np.ndarray] = []
         for position, raw in enumerate(raws):
             try:
-                record = normalize_record(raw)
-            except InvalidRecordError as exc:
+                record = self._normalize(raw)
+            except (ValueError, TypeError, ArithmeticError) as exc:
+                # InvalidRecordError is a ValueError. The others would be a gap in the
+                # validation, and one untrusted record must never abort the whole batch.
                 self.stats.invalid += 1
                 logger.warning("skipping invalid record #%d: %s", position, _reason(exc))
                 continue
@@ -151,6 +171,18 @@ class Detector:
             self._detection(record, features, prediction)
             for record, features, prediction in zip(records, rows, predictions, strict=True)
         ]
+
+    def _normalize(self, raw: Mapping[str, Any]) -> dict[str, Any]:
+        """``normalize_record``, plus the ``max_future_skew`` check."""
+        record = normalize_record(raw)
+        if self.max_future_skew is not None:
+            ahead = record["timestamp"] - self._clock()
+            if ahead > self.max_future_skew:
+                raise InvalidRecordError(
+                    f"timestamp is {ahead:.0f} s ahead of this host's clock (at most "
+                    f"{self.max_future_skew:g} s allowed); check the sender's clock"
+                )
+        return record
 
     def _detection(
         self, record: dict[str, Any], features: np.ndarray, prediction: Prediction
@@ -177,7 +209,7 @@ class Detector:
 
 def _reason(exc: Exception) -> str:
     """The error message, truncated: records are untrusted and may be arbitrarily large."""
-    text = str(exc)
+    text = str(exc) if isinstance(exc, InvalidRecordError) else f"{type(exc).__name__}: {exc}"
     if len(text) > _MAX_REASON_LENGTH:
         return text[:_MAX_REASON_LENGTH] + "..."
     return text

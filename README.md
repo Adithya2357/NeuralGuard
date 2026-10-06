@@ -13,15 +13,18 @@ single packets), and every alert is indexed into **Elasticsearch** and charted i
 $ neuralguard demo
 True label    Packets  Flagged as threat  Correct attack type
 ------------  -------  -----------------  -------------------
-normal           4232          35 (0.8%)                    -
-port_scan         331       331 (100.0%)          330 (99.7%)
-stealth_scan      574       574 (100.0%)         574 (100.0%)
-syn_flood         424       424 (100.0%)         424 (100.0%)
-udp_flood         263        239 (90.9%)         239 (100.0%)
-icmp_flood        176       176 (100.0%)         176 (100.0%)
+normal           4089           3 (0.1%)                    -
+port_scan         129        124 (96.1%)          123 (99.2%)
+stealth_scan      671        664 (99.0%)         664 (100.0%)
+syn_flood         186        179 (96.2%)         179 (100.0%)
+udp_flood         241        233 (96.7%)         233 (100.0%)
+icmp_flood        684       684 (100.0%)         684 (100.0%)
 
-Detection rate (attack packets flagged):       98.6% (1744 of 1768)
-False-positive rate (normal packets flagged):  0.8% (35 of 4232)
+Detection rate (attack packets flagged):       98.6% (1884 of 1911)
+False-positive rate (normal packets flagged):  0.1% (3 of 4089)
+Alerts emitted:                                13
+Alerts suppressed by throttling:               1873
+Lone detections not corroborated:              1
 ```
 
 ---
@@ -63,7 +66,7 @@ flowchart LR
     subgraph detect[neuralguard detect]
         norm[Validate record] --> feat[Sliding-window<br/>feature extractor]
         feat --> model[RandomForest<br/>threat model]
-        model --> throttle[Alert throttling]
+        model --> throttle[Corroboration +<br/>throttling]
     end
     throttle --> es[(Elasticsearch<br/>threat-detection)]
     throttle --> console[Console / JSON Lines]
@@ -75,17 +78,24 @@ flowchart LR
 2. **`neuralguard detect`** consumes the topic, validates each record, computes features over
    a sliding time window, and asks the model for a **threat score** (the probability that the
    packet is part of an attack) and the most likely **attack type**.
-3. Threats become **alerts** with a severity. During a flood every packet is a threat, so
-   alerts are throttled to one per (attack type, target) every few seconds. Each alert says
-   how many duplicates it stands for.
+3. Threats become **alerts** with a severity. An alert is raised only once the same
+   (attack type, target) has been detected **3 times within 30 s** (corroboration). Scans
+   and floods are many packets, while a lone misfire of the model is not. During a flood,
+   alerts are then throttled to one per (attack type, target) every few seconds, and each
+   alert says how many detections it stands for.
 4. Alerts go to the console, to Elasticsearch (explicit index mapping), and optionally to a
    JSON Lines file. The provisioned **Grafana** dashboard reads them from Elasticsearch.
 
 ## Features
 
-- **Behavioural detection.** Per-source and per-destination sliding-window features
-  (distinct ports and hosts contacted, SYN ratio, fan-in of distinct sources) make scans and
-  floods visible, even though each individual scan packet looks innocent.
+- **Behavioural detection.** Per-source, per-destination and per-pair sliding-window
+  features (distinct ports and hosts contacted, ports probed on this target, SYN ratio,
+  fan-in of distinct sources) make scans and floods visible, even though each individual
+  scan packet looks innocent.
+- **Low-noise alerting.** Corroboration (N detections of the same attack on the same target
+  before alerting) removes most false alarms without missing attacks, and throttling turns a
+  flood of thousands of packets into a handful of alerts. No threat is lost from the
+  accounting.
 - **One feature pipeline for training and detection.** The trainer and the detector share
   the same record validation and feature extractor, and the model file stores its window
   length, so there is no train/serve skew.
@@ -107,8 +117,8 @@ flowchart LR
   environment configuration, text or JSON logs, Docker image (non-root, model baked in
   read-only), `docker compose` stack bound to `127.0.0.1`, and GitHub Actions CI (ruff, tests
   on Python 3.10-3.13, bandit, pip-audit, Docker build).
-- **Well tested.** 500+ unit and integration tests run in about 10 seconds, with no Kafka or
-  Elasticsearch needed (fakes everywhere).
+- **Well tested.** 600+ unit and integration tests, about 15 seconds plus about 20 seconds of
+  model-quality tests (`-m "not slow"` skips them). No Kafka or Elasticsearch needed.
 
 ## Quick start: no infrastructure (1 minute)
 
@@ -120,7 +130,7 @@ cd NeuralGuard
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 
-neuralguard demo        # trains a model in memory if none exists, then runs the demo
+neuralguard demo        # trains a model in memory if none exists (~25 s), then runs
 ```
 
 `demo` streams simulated traffic through the real detector in-process and prints the alerts
@@ -129,7 +139,7 @@ plus a table comparing detections with the ground truth (see the top of this pag
 To train and save a model with a full evaluation report:
 
 ```bash
-neuralguard train       # -> models/threat_model.joblib (+ .sha256), about 10 s
+neuralguard train       # -> models/threat_model.joblib (+ .sha256), about 30 s
 ```
 
 ## Full stack: Kafka + Elasticsearch + Grafana
@@ -176,10 +186,18 @@ neuralguard produce --source pcap --pcap capture.pcapng
 neuralguard produce --source pcap --pcap capture.pcap --output traffic.jsonl
 ```
 
-By default the sniffer excludes the Kafka and Elasticsearch ports from your settings.
-Otherwise every published record would generate more captured packets (a feedback loop).
-`--bpf-filter 'tcp or udp'` sets a custom BPF filter (needs libpcap, e.g.
-`apt install libpcap0.8`), and `--bpf-filter ''` captures everything.
+By default the sniffer leaves out NeuralGuard's **own** connections: TCP to and from the
+exact Kafka and Elasticsearch host:port pairs in your settings. Otherwise every published
+record would generate more captured packets (a feedback loop). Other traffic on those port
+numbers is still captured, so an attacker cannot hide behind them. `--bpf-filter 'tcp or
+udp'` sets a custom BPF filter (needs libpcap, e.g. `apt install libpcap0.8`), and
+`--bpf-filter ''` captures everything.
+
+Packet lengths are normalised to an Ethernet frame size, so VLAN tags, Linux "cooked"
+captures and raw-IP pcaps produce the same `length` feature as the training data. A sniffer
+that dies (for example after an interface flap) makes `produce` exit with status 1, so
+`restart: on-failure` supervisors restart it. In a container, live capture needs root:
+`docker run --user root --network host ...`.
 
 > The bundled model is trained on **simulated** traffic. Expect false positives on a real
 > network until you retrain on labelled captures from it (see
@@ -195,26 +213,44 @@ Otherwise every published record would generate more captured packets (a feedbac
  "tcp_flags": "S"}
 ```
 
-**Features**: 21 per packet, computed by one stateful extractor:
+**Features**: 22 per packet, computed by one stateful extractor:
 
 | Group | Features |
 |---|---|
 | Packet | protocol (TCP/UDP/ICMP/ARP one-hot), `length`, `ttl`, `source_port`, `destination_port`, `dst_port_well_known`, TCP flags SYN/ACK/FIN/RST/PSH/URG |
 | Source window (last 10 s) | `src_packet_count`, `src_unique_dst_ports`, `src_unique_dst_ips`, `src_syn_ratio` |
 | Destination window (last 10 s) | `dst_packet_count`, `dst_unique_src_ips` |
+| Source-to-destination pair (last 10 s) | `pair_unique_dst_ports` (ports this source probed on this target) |
 
 Window time is driven by packet timestamps, not the wall clock, so replays behave exactly
-like live traffic. Memory is bounded even under spoofed-source floods (least recently seen
-hosts are forgotten).
+like live traffic. Live detection rejects records dated more than 5 minutes ahead of the
+host clock, so a forged timestamp cannot freeze the windows. If time jumps backwards (for
+example when an older capture is replayed), the windows restart. Memory is bounded even
+under spoofed-source floods: hosts whose window has expired are forgotten, and per-host
+windows are capped.
 
-**Model**: a multiclass `RandomForestClassifier` (`normal` plus 5 attack types).
-`threat_score = 1 - P(normal)`. A packet is a threat when the score reaches the threshold
-(default `0.5`). Severity: `critical` >= 0.9, `high` >= 0.75, `medium` >= 0.6, else `low`.
+**Model**: a multiclass `RandomForestClassifier` (`normal` plus 5 attack types), trained by
+default on 240,000 simulated packets from 4 independent streams. The first 10 packets of
+each attack episode are left out of training, because they carry no behavioural evidence
+yet: a flood's first SYN looks exactly like a new visitor's. `threat_score = 1 - P(normal)`.
+A packet is a threat when the score reaches the threshold (default `0.5`). Severity:
+`critical` >= 0.9, `high` >= 0.75, `medium` >= 0.6, else `low`.
 
-**Alerts**: one per (attack type, destination IP) per cooldown (default 5 s, packet time).
-`suppressed_count` carries the number of duplicates, and the remaining duplicates are
-flushed as a summary when the flood ends or at shutdown, so `1 + suppressed_count` summed over
-all alerts equals the number of threat packets.
+**Alerts**: two stages, both on packet time.
+
+1. **Corroboration.** The first alert for an (attack type, destination IP) needs
+   `--min-hits` detections (default 3) within `--corroboration-window` (default 30 s).
+   Detections that never reach that are counted as `uncorroborated` and never alerted.
+   Once an attack is corroborated, it stays so while detections keep coming.
+2. **Throttling.** At most one alert per (attack type, destination IP) per cooldown
+   (default 5 s). `suppressed_count` carries the number of detections an alert stands for,
+   and the remaining ones are flushed as a summary when the flood ends or at shutdown.
+
+Every threat is accounted for: alerts + suppressed + uncorroborated = threats. On the
+held-out test streams, corroboration cut false alerts by 50-73% while every one of the 50
+attack episodes still raised an alert. Scans of up to one probe every 3 s are still
+alerted. Slower ones are beyond what the 10 s feature window can see anyway. Use
+`--min-hits 1` to alert on the first detection.
 
 **Model file**: a versioned joblib bundle with the feature names, window length, training
 parameters and metrics, plus a `sha256sum`-style sidecar that is verified **before**
@@ -222,18 +258,23 @@ unpickling.
 
 ## Model performance
 
-`neuralguard train` with defaults: 60,000 simulated packets for training, evaluated on a
-**separate** 15,000-packet stream with a different seed, so the hosts, timings and attack
-episodes are all unseen:
+`neuralguard train` with defaults: 240,000 simulated packets from 4 independent streams
+for training, evaluated on **4 separate held-out streams** (60,000 packets, different seeds),
+so the hosts, timings and all 50 attack episodes are unseen:
 
 | Metric | Value |
 |---|---|
-| Detection rate (attack packets flagged) | 99.95% |
-| False-positive rate (normal packets flagged) | 0.42% |
+| Detection rate (attack packets flagged) | 98.4% (97.4-98.8% across streams) |
+| False-positive rate (normal packets flagged) | 0.12% (0.10-0.18% across streams) |
+| Attack episodes detected | **50 of 50** (median 3.5 packets before the first detection) |
+| False alerts on attack-free traffic | about 127 per hour (busy simulated LAN, after corroboration and throttling) |
 | ROC-AUC (threat vs normal) | 0.9998 |
-| Attack-type accuracy (flagged attacks) | 100% |
-| Per-class recall | port_scan 1.00, stealth_scan 1.00, syn_flood 0.998, udp_flood 1.00, icmp_flood 1.00 |
-| Training time | about 7 s (4 cores) |
+| Attack-type accuracy (flagged attacks) | 99.4% |
+| Per-class recall | port_scan 0.969, stealth_scan 0.965, syn_flood 0.985, udp_flood 0.992, icmp_flood 0.992 |
+| Training time | about 30 s (4 cores) |
+
+The packets that are missed are mostly the first few of each episode, before the window
+features have any evidence.
 
 **Read these numbers honestly.** They are measured on synthetic traffic from the same
 simulator family. They show the pipeline and the behavioural features work, not how the model
@@ -273,10 +314,14 @@ Every setting can be set with an environment variable. Command-line flags overri
 | `NEURALGUARD_THREAT_THRESHOLD` | `0.5` | threat-score threshold, in (0, 1] |
 | `NEURALGUARD_WINDOW_SECONDS` | `10` | feature window used by `train` |
 | `NEURALGUARD_ALERT_COOLDOWN_SECONDS` | `5` | alert throttling per (type, target); `0` disables |
+| `NEURALGUARD_ALERT_MIN_HITS` | `3` | detections of the same (type, target) needed before the first alert; `1` = alert at once |
+| `NEURALGUARD_ALERT_CORROBORATION_SECONDS` | `30` | time window for `ALERT_MIN_HITS` |
+| `NEURALGUARD_MAX_CLOCK_SKEW_SECONDS` | `300` | `detect` rejects records dated further ahead of the host clock; `0` disables |
 | `NEURALGUARD_LOG_LEVEL` | `INFO` | `DEBUG` ... `CRITICAL` |
 | `NEURALGUARD_LOG_FORMAT` | `text` | `text` or `json` (one object per line) |
 
-Secrets are never logged or shown in `repr()`.
+Secrets are never logged or shown in `repr()`, including credentials embedded in an
+Elasticsearch URL. Prefer the username/password or API key variables.
 
 ## Command reference
 
@@ -284,8 +329,8 @@ Secrets are never logged or shown in `repr()`.
 |---|---|---|
 | `neuralguard train` | train, evaluate on held-out data, print a report, save the model | `--samples`, `--trees`, `--window`, `--data FILE.jsonl`, `--output`, `--report-json` |
 | `neuralguard produce` | publish records to Kafka (or a JSON Lines file) | `--source simulate\|live\|pcap`, `--count`, `--seed`, `--attack-ratio`, `--no-pace`, `--interface`, `--bpf-filter`, `--pcap`, `--output` |
-| `neuralguard detect` | consume, detect, alert | `--model`, `--threshold`, `--cooldown`, `--no-elasticsearch`, `--alerts-file`, `--max-messages` |
-| `neuralguard demo` | the whole pipeline in-process, no infrastructure | `--count`, `--seed`, `--attack-ratio`, `--threshold`, `--model` |
+| `neuralguard detect` | consume, detect, alert | `--model`, `--threshold`, `--cooldown`, `--min-hits`, `--corroboration-window`, `--max-clock-skew`, `--no-elasticsearch`, `--alerts-file`, `--max-messages` |
+| `neuralguard demo` | the whole pipeline in-process, no infrastructure | `--count`, `--seed`, `--attack-ratio`, `--threshold`, `--cooldown`, `--min-hits`, `--model` |
 
 Global options: `--log-level`, `--log-format text|json`, `--version`. Exit codes: `0` ok,
 `1` service or I/O error, `2` bad input or configuration, `130` interrupted.
@@ -333,10 +378,15 @@ tests/           unit and integration tests (no external services needed)
 - **Model files are pickles. Only load models you trust.** NeuralGuard verifies the
   `.sha256` sidecar before unpickling. In the Docker image the model is owned by root and is
   read-only for the unprivileged runtime user.
-- **Traffic is untrusted input.** Every record is validated (types, ranges, IP syntax,
-  plausible timestamps). Malformed messages are skipped and counted. Logged payloads are
-  truncated, and all in-memory state (windows, throttling keys, buffers, capture queue) is
-  bounded.
+- **Traffic is untrusted input.** Every record is validated: types, ranges, canonical IP
+  syntax (IPv6 zone IDs are rejected, since they could smuggle control characters into logs),
+  and plausible timestamps (integers too large for a float, and dates far in the future, are
+  rejected). One malformed message is skipped and counted. It can never crash the detector.
+  Logged payloads are truncated, console alerts escape control characters, and all in-memory
+  state (windows, throttling and corroboration keys, buffers, capture queue) is bounded.
+- **The sensor cannot be evaded through NeuralGuard's own ports.** Only its exact Kafka and
+  Elasticsearch connections are excluded from capture, not every packet on those port
+  numbers.
 
 ## Upgrading from v0.1
 

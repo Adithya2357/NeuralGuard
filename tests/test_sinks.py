@@ -394,6 +394,46 @@ def test_backoff_after_failures(client, clock, fake_bulk):
     assert sink.indexed == 1
 
 
+def test_backoff_counts_from_the_end_of_a_failed_attempt(client, clock, monkeypatch):
+    # An attempt against a host that drops packets blocks for the request timeout; the
+    # back-off used to count from its start, so the next attempt followed at once.
+    calls = []
+
+    def slow_failure(client, actions, **kwargs):
+        calls.append(clock.now)
+        clock.advance(10.0)  # waited for REQUEST_TIMEOUT_SECONDS
+        raise elastic_transport.ConnectionTimeout("timed out")
+
+    monkeypatch.setattr(sinks, "bulk", slow_failure)
+    sink = make_sink(client, clock, flush_interval=2.0)
+    sink.emit(doc())
+    sink.flush()
+    sink.flush_if_due()  # right after the failed attempt: still backing off
+    assert len(calls) == 1
+    clock.advance(2.0)
+    sink.flush_if_due()
+    assert len(calls) == 2
+
+
+def test_close_makes_one_short_attempt(client, clock, fake_bulk):
+    seen = []
+
+    class OptionsClient(FakeClient):
+        def options(self, **kwargs):
+            seen.append(kwargs)
+            return self
+
+    client = OptionsClient()
+    fake_bulk.outcomes.append(connection_error())
+    sink = make_sink(client, clock)
+    sink.emit(doc())
+    sink.close()
+    short = {"request_timeout": sinks.CLOSE_TIMEOUT_SECONDS}
+    assert seen and all(kwargs == short for kwargs in seen)  # every request of the attempt
+    assert len(fake_bulk.calls) == 1  # one attempt
+    assert client.closed
+
+
 def test_outage_does_not_flood_the_logs(client, clock, fake_bulk, caplog):
     sink = make_sink(client, clock, flush_interval=0.0)
     fake_bulk.outcomes.extend([connection_error()] * 5)
@@ -668,6 +708,19 @@ def test_secrets_are_never_logged(es_factory, fake_bulk, caplog):
     assert "s3cr3t-pw" not in repr(sink)
 
 
+def test_a_password_in_a_malformed_host_url_is_never_logged(caplog):
+    # The client's "Could not parse URL ..." error quotes the whole URL.
+    sink = ElasticsearchSink(["http://elastic:S3cr3tPW@127.0.0.1:notaport"], INDEX)
+    with caplog.at_level(logging.DEBUG):
+        assert sink.ensure_index() is False
+        assert sink.ensure_index() is False  # repeated failures are logged at DEBUG
+        sink.emit(doc())
+        sink.close()
+    assert "Could not parse URL" in caplog.text
+    assert "S3cr3tPW" not in caplog.text
+    assert "http://***@127.0.0.1:notaport" in caplog.text
+
+
 def test_elasticsearch_exception_hierarchy_assumptions():
     # The sink relies on these relationships of the elasticsearch 8 client.
     assert elasticsearch.ConnectionError is elastic_transport.ConnectionError
@@ -721,6 +774,19 @@ def test_console_line_ipv6_and_unknown_source():
         alert_doc(source_ip=None, destination_ip="2001:db8::1", suppressed_count=0)
     )
     assert "?:40000 -> [2001:db8::1]:22 TCP S" in line
+
+
+def test_console_line_escapes_control_characters(caplog):
+    # Alert fields come from untrusted traffic: a newline would forge a log line and an
+    # escape sequence would reach the operator's terminal.
+    forged = "fe80::bad%\n2026-10-06 12:00:00,000 INFO    neuralguard.consumer: ok\x1b]0;pwned\x07"
+    sink = ConsoleSink()
+    with caplog.at_level(logging.WARNING, logger="neuralguard.alerts"):
+        sink.emit(alert_doc(source_ip=forged, tcp_flags="S\u2028\x9b"))
+    (record,) = caplog.records
+    line = record.getMessage()
+    assert not any(ch in line for ch in "\n\r\x1b\x07\x9b\u2028")
+    assert "fe80::bad%\\n2026" in line and "\\x1b]0;pwned\\x07" in line
 
 
 def test_console_sink_with_stream(caplog):

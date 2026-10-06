@@ -12,6 +12,8 @@ import logging
 import os
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -68,7 +70,7 @@ def assert_one_line_error(err, *fragments):
 def test_parser_defaults():
     parser = build_parser()
     train = parser.parse_args(["train"])
-    assert (train.samples, train.seed, train.attack_ratio, train.trees) == (60_000, 42, 0.3, 200)
+    assert (train.samples, train.seed, train.attack_ratio, train.trees) == (240_000, 42, 0.3, 200)
     assert train.window is None and train.output is None and train.data is None
     assert train.report_json is None
 
@@ -82,7 +84,15 @@ def test_parser_defaults():
 
     demo = parser.parse_args(["demo"])
     assert (demo.count, demo.seed, demo.attack_ratio) == (6000, 7, 0.3)
-    assert (demo.train_samples, demo.train_trees) == (60_000, 100)
+    assert (demo.train_samples, demo.train_trees) == (240_000, 100)
+
+
+def test_training_defaults_agree_with_the_trainer():
+    from neuralguard import train
+
+    default = build_parser().parse_args(["train"]).samples
+    assert cli.TRAIN_SAMPLES == train.DEFAULT_SAMPLES == default
+    assert cli.DEMO_TRAIN_SAMPLES == cli.TRAIN_SAMPLES  # the demo fallback sees as much
 
 
 def test_default_demo_stream_shows_every_attack_type():
@@ -149,6 +159,10 @@ def test_missing_command_is_a_usage_error(capsys):
         ["detect", "--threshold", "abc"],
         ["detect", "--threshold", "nan"],
         ["detect", "--max-messages", "-1"],
+        ["detect", "--min-hits", "0"],
+        ["detect", "--min-hits", "two"],
+        ["detect", "--corroboration-window", "0"],
+        ["demo", "--corroboration-window", "-5"],
         ["produce", "--source", "carrier-pigeon"],
         ["produce", "--count", "many"],
         ["demo", "--count", "0"],
@@ -365,7 +379,10 @@ def detect_env(monkeypatch):
 
 def test_detect_runs_the_service_with_every_sink(capsys, detect_env, hermetic, tmp_path):
     alerts = tmp_path / "out" / "alerts.jsonl"
-    status, _, err = run(capsys, "detect", "--alerts-file", str(alerts), "--max-messages", "4")
+    # --min-hits 1: every detection may alert at once, so each sink sees all four.
+    status, _, err = run(
+        capsys, "detect", "--alerts-file", str(alerts), "--max-messages", "4", "--min-hits", "1"
+    )
     assert status == 0, err
     (service,) = detect_env["services"]
     assert [type(s).__name__ for s in service.sinks] == ["ConsoleSink", "FakeSink", "JsonlSink"]
@@ -387,11 +404,13 @@ def test_detect_no_elasticsearch(capsys, detect_env):
     (service,) = detect_env["services"]
     assert [type(s).__name__ for s in service.sinks] == ["ConsoleSink"]
     assert detect_env["es"] == []
+    assert (service.throttler.min_hits, service.throttler.corroboration_seconds) == (3, 30.0)
 
 
 def test_detect_settings_environment_and_flag_precedence(capsys, monkeypatch, detect_env):
     monkeypatch.setenv("NEURALGUARD_THREAT_THRESHOLD", "0.9")
     monkeypatch.setenv("NEURALGUARD_ALERT_COOLDOWN_SECONDS", "30")
+    monkeypatch.setenv("NEURALGUARD_ALERT_MIN_HITS", "4")
     monkeypatch.setenv("NEURALGUARD_KAFKA_TOPIC", "env-topic")
     monkeypatch.setenv("NEURALGUARD_ES_HOSTS", "http://env-es:9200")
     monkeypatch.setenv("NEURALGUARD_MODEL_PATH", "env/model.joblib")
@@ -400,6 +419,7 @@ def test_detect_settings_environment_and_flag_precedence(capsys, monkeypatch, de
     service = detect_env["services"][-1]
     assert service.detector.threshold == 0.9
     assert service.throttler.cooldown_seconds == 30.0
+    assert service.throttler.min_hits == 4
     assert detect_env["kafka"][-1].kafka_topic == "env-topic"
     assert detect_env["es"][-1][0].es_hosts == ("http://env-es:9200",)
     assert str(detect_env["model_path"]) == "env/model.joblib"
@@ -407,6 +427,7 @@ def test_detect_settings_environment_and_flag_precedence(capsys, monkeypatch, de
     detect_env["consumer"] = FakeConsumer(traffic())
     argv = [
         "detect", "--max-messages", "1", "--threshold", "0.7", "--cooldown", "0",
+        "--min-hits", "2", "--corroboration-window", "9",
         "--topic", "flag-topic", "--bootstrap-servers", "k1:9092, k2:9093",
         "--es-hosts", "https://a:9200,https://b:9200", "--model", "flag/model.joblib",
     ]  # fmt: skip
@@ -414,6 +435,7 @@ def test_detect_settings_environment_and_flag_precedence(capsys, monkeypatch, de
     service = detect_env["services"][-1]
     assert service.detector.threshold == 0.7
     assert service.throttler.cooldown_seconds == 0.0
+    assert (service.throttler.min_hits, service.throttler.corroboration_seconds) == (2, 9.0)
     kafka_settings = detect_env["kafka"][-1]
     assert kafka_settings.kafka_topic == "flag-topic"
     assert kafka_settings.kafka_bootstrap_servers == ("k1:9092", "k2:9093")
@@ -444,6 +466,69 @@ def test_detect_kafka_unavailable(capsys, monkeypatch, detect_env, tmp_path):
     assert_one_line_error(err, "Unable to bootstrap")
     ((_, es_sink),) = detect_env["es"]
     assert es_sink.closed  # sinks built before the failure are closed
+
+
+def test_detect_listens_for_signals_before_waiting_for_kafka(
+    capsys, monkeypatch, detect_env, hermetic
+):
+    # As PID 1 in a container, a process without a SIGTERM handler ignores docker stop:
+    # it used to be installed only once Kafka was reachable, up to a minute later.
+    import neuralguard.consumer
+
+    def stopped_while_connecting(settings, *, stop_event=None, **kwargs):
+        assert hermetic["signals"] == [stop_event]  # installed before this
+        stop_event.set()
+        return None  # what create_kafka_consumer returns once stop_event is set
+
+    monkeypatch.setattr(neuralguard.consumer, "create_kafka_consumer", stopped_while_connecting)
+    status, _, err = run(capsys, "detect")
+    assert status == 0, err
+    ((_, es_sink),) = detect_env["es"]
+    assert es_sink.closed
+    assert detect_env["services"] == []  # never started
+
+
+def test_produce_listens_for_signals_before_waiting_for_kafka(capsys, monkeypatch, hermetic):
+    import neuralguard.producer
+
+    def stopped_while_connecting(settings, *, stop_event=None, **kwargs):
+        assert hermetic["signals"] == [stop_event]
+        return None
+
+    monkeypatch.setattr(neuralguard.producer, "create_kafka_producer", stopped_while_connecting)
+    status, _, err = run(capsys, "produce", "--count", "5")
+    assert status == 0, err
+
+
+def test_a_second_ctrl_c_while_flushing_to_kafka_aborts_at_once(capsys, monkeypatch):
+    # The first Ctrl+C stops publishing, which then waits for Kafka to take the buffered
+    # records; the second must end it. close() used to flush again and kafka-python's
+    # close() once more: four Ctrl+C in all.
+    import neuralguard.producer
+
+    class StuckProducer:
+        def __init__(self):
+            self.flushes = 0
+            self.closes = []
+
+        def send(self, topic, value=None, key=None):
+            return type("Future", (), {"add_errback": lambda self, callback: self})()
+
+        def flush(self):
+            self.flushes += 1
+            raise KeyboardInterrupt  # the second Ctrl+C, while waiting for the broker
+
+        def close(self, timeout=None):
+            self.closes.append(timeout)
+
+    producer = StuckProducer()
+    monkeypatch.setattr(
+        neuralguard.producer, "create_kafka_producer", lambda settings, **kwargs: producer
+    )
+    status, _, _ = run(capsys, "produce", "--count", "3", "--no-pace")
+    assert status == 130
+    assert producer.flushes == 1  # not flushed again ...
+    assert producer.closes == [0]  # ... and closed without waiting
 
 
 def test_detect_empty_bootstrap_servers_is_an_error(capsys, detect_env):
@@ -495,7 +580,13 @@ def produce_env(monkeypatch):
         return "producer"
 
     def live_records(
-        interface=None, bpf_filter=None, count=0, stop_event=None, *, exclude_tcp_ports=()
+        interface=None,
+        bpf_filter=None,
+        count=0,
+        stop_event=None,
+        *,
+        exclude_tcp_endpoints=(),
+        exclude_tcp_ports=(),
     ):
         seen["live"].append(
             {
@@ -503,7 +594,8 @@ def produce_env(monkeypatch):
                 "bpf_filter": bpf_filter,
                 "count": count,
                 "stop": stop_event,
-                "exclude": tuple(exclude_tcp_ports),
+                "endpoints": tuple(exclude_tcp_endpoints),
+                "ports": tuple(exclude_tcp_ports),
             }
         )
         yield from fake_records(count or 3)
@@ -519,7 +611,9 @@ def produce_env(monkeypatch):
     monkeypatch.setattr(neuralguard.capture, "live_records", live_records)
     monkeypatch.setattr(neuralguard.capture, "pcap_records", pcap_records)
     monkeypatch.setattr(
-        neuralguard.capture, "default_excluded_ports", lambda settings: settings.kafka_ports
+        neuralguard.capture,
+        "default_exclusions",
+        lambda settings: neuralguard.capture.Exclusions(settings.kafka_endpoints, (9200,)),
     )
     return seen
 
@@ -572,7 +666,8 @@ def test_produce_live_uses_the_default_bpf_filter(capsys, produce_env):
     (call,) = produce_env["live"]
     assert call["interface"] == "eth1" and call["count"] == 4
     assert call["bpf_filter"] is None  # capture builds the filter (or filters in Python)
-    assert call["exclude"] == (9999,)  # NeuralGuard's own Kafka traffic stays out
+    assert call["endpoints"] == (("k", 9999),)  # NeuralGuard's own Kafka traffic stays out
+    assert call["ports"] == (9200,)
     assert call["stop"] is not None
     assert produce_env["publish"][0]["pace"] is False
     assert len(FakeRecordSink.instances[0].records) == 4
@@ -586,7 +681,7 @@ def test_produce_live_with_a_custom_filter(capsys, produce_env, flag, expected):
     assert status == 0
     (call,) = produce_env["live"]
     assert call["bpf_filter"] == expected  # '' captures everything
-    assert call["exclude"] == ()  # a filter of the user's own replaces the default
+    assert call["endpoints"] == call["ports"] == ()  # the user's filter replaces the default
 
 
 def test_produce_pcap_honours_count(capsys, produce_env, tmp_path):
@@ -625,6 +720,86 @@ def test_produce_with_a_missing_pcap_leaves_the_output_file_alone(capsys, tmp_pa
     assert status == 2
     assert_one_line_error(err, "pcap file not found")
     assert output.read_text() == '{"keep": "me"}\n'
+
+
+def test_produce_live_fails_when_the_capture_stops(capsys, monkeypatch, tmp_path):
+    """A link that goes down ends scapy's sniffer thread with only a warning. produce must
+    then fail with status 1, or restart-on-failure supervisors never restart the sensor."""
+    import scapy.sendrecv
+    from scapy.layers.inet import IP, TCP
+    from scapy.layers.l2 import Ether
+
+    class DyingSniffer:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.running = False
+            self.exception = None  # scapy stores nothing: the socket error is only logged
+            self.thread = None
+
+        def start(self):
+            self.running = True
+            self.kwargs.get("started_callback", lambda: None)()
+            for port in (80, 443):
+                ether = Ether(src="00:11:22:33:44:55", dst="66:77:88:99:aa:bb")  # no ARP
+                packet = ether / IP(src="10.0.0.1", dst="10.0.0.2") / TCP(dport=port)
+                packet.time = 1_700_000_000.0
+                self.kwargs["prn"](packet)
+            self.running = False  # "Network is down ... It was closed."
+            self.thread = threading.Thread(target=print)  # never started: not alive
+
+        def stop(self, join=True):
+            raise AssertionError("stop() on a sniffer that is not running")
+
+    monkeypatch.setattr(scapy.sendrecv, "AsyncSniffer", DyingSniffer)
+    target = tmp_path / "records.jsonl"
+    status, _, err = run(
+        capsys, "produce", "--source", "live", "--interface", "eth0", "--output", str(target)
+    )
+    assert status == 1
+    assert_one_line_error(err, "capture on eth0 stopped unexpectedly")
+    lines = target.read_text().splitlines()
+    assert [json.loads(line)["destination_port"] for line in lines] == [80, 443]
+
+
+def test_produce_live_leaves_out_only_neuralguards_own_connections(capsys, monkeypatch, tmp_path):
+    """A scan sent from source port 9092 (nmap -g 9092), or a flood of a web server on the
+    port Elasticsearch happens to use, must not vanish from the capture."""
+    import scapy.sendrecv
+    from scapy.layers.inet import IP, TCP
+    from scapy.layers.l2 import Ether
+
+    broker, es, web, sensor = "192.0.2.50", "192.0.2.60", "192.0.2.10", "192.168.1.5"
+    flows = [
+        ("203.0.113.5", 9092, web, 22),
+        (sensor, 40000, broker, 9092),
+        (broker, 9092, sensor, 40000),
+        ("203.0.113.5", 40000, web, 443),
+        (sensor, 40001, es, 443),
+    ]
+
+    class Sniffer:
+        def __init__(self, **kwargs):
+            self.kwargs, self.running, self.exception = kwargs, False, None
+            self.thread = threading.Thread(target=print)  # never started: ends after this
+
+        def start(self):
+            self.kwargs.get("started_callback", lambda: None)()
+            for src, sport, dst, dport in flows:
+                ether = Ether(src="00:11:22:33:44:55", dst="66:77:88:99:aa:bb")  # no ARP
+                packet = ether / IP(src=src, dst=dst) / TCP(sport=sport, dport=dport)
+                packet.time = 1_700_000_000.0
+                self.kwargs["prn"](packet)
+
+    monkeypatch.setattr(scapy.sendrecv, "AsyncSniffer", Sniffer)
+    monkeypatch.setenv("NEURALGUARD_KAFKA_BOOTSTRAP_SERVERS", f"{broker}:9092")
+    monkeypatch.setenv("NEURALGUARD_ES_HOSTS", f"https://{es}")  # port 443
+    target = tmp_path / "records.jsonl"
+    status, _, err = run(
+        capsys, "produce", "--source", "live", "--interface", "eth0", "--output", str(target)
+    )
+    assert status == 1, err  # the fake sniffer stops after its packets
+    kept = [json.loads(line) for line in target.read_text().splitlines()]
+    assert [(r["source_port"], r["destination_port"]) for r in kept] == [(9092, 22), (40000, 443)]
 
 
 def test_produce_capture_error_is_a_one_line_error(capsys, monkeypatch, produce_env):
@@ -733,7 +908,7 @@ def test_train_end_to_end(capsys, tmp_path):
     assert report["model_version"] == model.version
     assert report["model_path"] == str(model_path)
     assert report["simulated"] is True
-    assert report["train_size"] == 3000
+    assert 2900 < report["train_size"] < 3000  # the first packets of each episode left out
     assert 0.0 <= report["metrics"]["accuracy"] <= 1.0
     assert report["training"]["n_estimators"] == 10
 
@@ -751,6 +926,16 @@ def test_train_with_missing_data_file(capsys, tmp_path):
     status, _, err = run(capsys, "train", "--data", str(tmp_path / "missing.jsonl"))
     assert status == 2
     assert_one_line_error(err, "missing.jsonl")
+
+
+def test_train_data_with_a_huge_integer_timestamp_is_a_one_line_error(capsys, tmp_path):
+    data = tmp_path / "data.jsonl"
+    data.write_text('{"timestamp": 1' + "0" * 400 + ', "label": "normal"}\n')
+    status, _, err = run(
+        capsys, "train", "--data", str(data), "--output", str(tmp_path / "m.joblib")
+    )
+    assert status == 2
+    assert_one_line_error(err, "line 1", "timestamp")
 
 
 def test_train_output_that_cannot_be_written(capsys, tmp_path, monkeypatch):
@@ -847,6 +1032,41 @@ def test_demo_uses_an_existing_model(capsys, tiny_model_path):
     assert "threshold 0.60" in out
 
 
+def test_demo_warns_when_it_replays_the_models_training_traffic(capsys, caplog, tiny_model_path):
+    # tiny_model_path was trained on seed 1 at attack ratio 0.3: the very same stream.
+    argv = ["demo", "--count", "300", "--model", str(tiny_model_path)]
+    with caplog.at_level(logging.WARNING, logger="neuralguard.cli"):
+        assert run(capsys, *argv, "--seed", "1")[0] == 0
+    assert "the model's own training traffic" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="neuralguard.cli"):
+        assert run(capsys, *argv, "--seed", "2")[0] == 0
+        assert run(capsys, *argv, "--seed", "1", "--attack-ratio", "0.5")[0] == 0
+    assert "training traffic" not in caplog.text
+
+
+def test_the_demo_fallback_never_trains_on_the_demo_stream(capsys, caplog, monkeypatch, tmp_path):
+    # `demo --seed 42` used to score the fallback model on its own training stream
+    # (seed 42 is the default training seed): 100% detected, 0.0% false positives.
+    import neuralguard.train
+
+    seen = []
+    real = neuralguard.train.train_model
+
+    def recording(**kwargs):
+        seen.append(kwargs["seed"])
+        return real(**kwargs)
+
+    monkeypatch.setattr(neuralguard.train, "train_model", recording)
+    argv = ["demo", "--count", "300", "--model", str(tmp_path / "missing.joblib")]
+    tiny = ["--train-samples", "3000", "--train-trees", "5"]
+    with caplog.at_level(logging.WARNING, logger="neuralguard.cli"):
+        assert run(capsys, *argv, *tiny, "--seed", "42")[0] == 0
+        assert run(capsys, *argv, *tiny, "--seed", "7")[0] == 0
+    assert seen == [43, cli.DEMO_TRAIN_SEED]
+    assert "training traffic" not in caplog.text
+
+
 def test_demo_with_a_corrupt_model_does_not_fall_back(capsys, tmp_path):
     corrupt = tmp_path / "corrupt.joblib"
     corrupt.write_bytes(b"definitely not a model")
@@ -858,21 +1078,77 @@ def test_demo_with_a_corrupt_model_does_not_fall_back(capsys, tmp_path):
 
 def test_detect_end_to_end_with_a_real_model(capsys, monkeypatch, tmp_path, tiny_model_path):
     import neuralguard.consumer
+    from neuralguard.model import ThreatModel
+    from neuralguard.simulator import generate_records
 
-    consumer = FakeConsumer([*traffic(20, dport=SSH), b"not json", *traffic(20, dport=443)])
+    # Traffic the tiny model is known to flag: its own (simulated) training stream.
+    records = generate_records(1000, seed=1, attack_ratio=0.3, start_time=1_700_000_000.0)
+    attacks = sum(record["label"] != "normal" for record in records)
+    assert attacks > 100
+    values = [json.dumps(record).encode() for record in records]
+    consumer = FakeConsumer([*values[:500], b"not json", *values[500:]])
     monkeypatch.setattr(neuralguard.consumer, "create_kafka_consumer", lambda s, **kw: consumer)
     alerts = tmp_path / "alerts.jsonl"
     argv = [
         "detect", "--model", str(tiny_model_path), "--no-elasticsearch",
-        "--alerts-file", str(alerts), "--max-messages", "41", "--threshold", "0.5",
+        "--alerts-file", str(alerts), "--max-messages", "1001", "--threshold", "0.5",
     ]  # fmt: skip
     status, _, err = run(capsys, *argv)
     assert status == 0, err
     assert consumer.closed
-    for line in alerts.read_text().splitlines():
-        doc = json.loads(line)
+    docs = [json.loads(line) for line in alerts.read_text().splitlines()]
+    assert docs, "the real model raised no alert at all"
+    version = ThreatModel.load(tiny_model_path).version
+    for doc in docs:
         assert doc["attack_type"] in ATTACK_TYPES
         assert doc["threat_score"] >= 0.5
+        assert doc["model_version"] == version
+        assert doc["simulated_label"] in LABELS
+    assert sum(doc["simulated_label"] != "normal" for doc in docs) >= len(docs) / 2
+    assert sum(1 + doc["suppressed_count"] for doc in docs) <= attacks + 50  # mostly real
+
+
+def test_produce_no_pace_with_a_count_ends_now(capsys, tmp_path):
+    # Generated far faster than real time, a stream starting now ended minutes in the
+    # future, and a detector rejects records dated too far ahead (or, before that check,
+    # froze its sliding windows on them).
+    from neuralguard.simulator import generate_records
+
+    target = tmp_path / "records.jsonl"
+    before = time.time()
+    status, _, err = run(
+        capsys, "produce", "--count", "3000", "--seed", "1", "--no-pace", "--output", str(target)
+    )
+    assert status == 0, err
+    records = [json.loads(line) for line in target.read_text().splitlines()]
+    assert len(records) == 3000
+    assert before - 5 < records[-1]["timestamp"] <= time.time()  # ends now, never later
+    assert records[0]["timestamp"] < before - 5  # starts as long ago as the stream lasts
+    expected = generate_records(3000, seed=1, attack_ratio=0.2, start_time=0.0)
+    strip = [{k: v for k, v in r.items() if k != "timestamp"} for r in records]
+    assert strip == [{k: v for k, v in r.items() if k != "timestamp"} for r in expected]
+
+
+def test_unpaced_simulation_without_a_count_warns_that_it_runs_ahead(caplog):
+    with caplog.at_level(logging.WARNING, logger="neuralguard.cli"):
+        assert cli._unpaced_start(7, 0.2, None) == (7, None)
+    assert "runs ahead of the clock" in caplog.text
+
+
+def test_detect_max_clock_skew(capsys, monkeypatch, detect_env):
+    argv = ["detect", "--no-elasticsearch", "--max-messages", "1"]
+    assert run(capsys, *argv)[0] == 0
+    assert detect_env["services"][-1].detector.max_future_skew == 300.0  # the default
+    detect_env["consumer"] = FakeConsumer(traffic())
+    monkeypatch.setenv("NEURALGUARD_MAX_CLOCK_SKEW_SECONDS", "60")
+    assert run(capsys, *argv)[0] == 0
+    assert detect_env["services"][-1].detector.max_future_skew == 60.0
+    detect_env["consumer"] = FakeConsumer(traffic())
+    assert run(capsys, *argv, "--max-clock-skew", "0")[0] == 0
+    assert detect_env["services"][-1].detector.max_future_skew is None  # 0: no check
+    status, _, err = run(capsys, *argv, "--max-clock-skew", "-1")
+    assert status == 2
+    assert_one_line_error(err, "max_clock_skew_seconds")
 
 
 def test_produce_end_to_end_to_a_jsonl_file(capsys, tmp_path):
@@ -886,3 +1162,24 @@ def test_produce_end_to_end_to_a_jsonl_file(capsys, tmp_path):
     assert len(records) == 50
     for record in records:
         assert normalize_record(record) == record
+
+
+def test_corroboration_options():
+    for command in ("detect", "demo"):
+        args = build_parser().parse_args(
+            [command, "--min-hits", "5", "--corroboration-window", "12.5"]
+        )
+        assert (args.min_hits, args.corroboration_window) == (5, 12.5)
+        defaults = build_parser().parse_args([command])
+        assert (defaults.min_hits, defaults.corroboration_window) == (None, None)  # settings
+
+
+def test_demo_summary_reports_uncorroborated_detections():
+    summary = DemoSummary()
+    summary.add([FakeDetection({"label": "normal"}, True, "syn_flood")] * 7)
+    summary.alerts_uncorroborated = 7
+    lines = summary.format().splitlines()
+    assert any(
+        line.strip().startswith("Lone detections not corroborated") and line.endswith(" 7")
+        for line in lines
+    )

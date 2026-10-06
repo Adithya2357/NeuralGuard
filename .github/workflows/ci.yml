@@ -26,9 +26,9 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
+          # No pip cache: its key would be the one of the 3.12 jobs that install ".[dev]",
+          # and this job, done first, would save a cache holding nothing but ruff.
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
       - name: Install ruff
         run: python -m pip install "ruff>=0.6"
       - name: Ruff
@@ -99,3 +99,12 @@ jobs:
         run: |
           docker run --rm --network none neuralguard:ci --version
           docker run --rm --network none neuralguard:ci demo --count 2000
+      - name: docker stop works while Kafka is unreachable
+        run: |
+          docker run -d --network none --name neuralguard-stop neuralguard:ci detect --no-elasticsearch
+          sleep 3
+          docker stop neuralguard-stop
+          code=$(docker inspect -f '{{.State.ExitCode}}' neuralguard-stop)
+          docker rm neuralguard-stop
+          echo "exit code: $code"
+          test "$code" != 137  # 137 = killed after the grace period: the signal was ignored
