@@ -1,15 +1,31 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 build/
 dist/
-.pytest_cache/
-.ruff_cache/
-.coverage
-htmlcov/
+
+# Virtual environments
 .venv/
 venv/
 neuralguard-env/
+
+# Test, coverage and lint caches
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# Trained models are build outputs (models/.gitkeep keeps the directory)
 models/*.joblib
 models/*.sha256
+
+# JSON Lines output (neuralguard produce --output, detect --alerts-file)
+*.jsonl
+!tests/**/*.jsonl
+
+# Local secrets
 .env

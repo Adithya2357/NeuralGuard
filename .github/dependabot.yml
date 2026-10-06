@@ -1,0 +1,43 @@
+# Weekly dependency update PRs. Majors that need code changes are held back explicitly.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      dev-tools:
+        patterns: ["pytest*", "ruff", "bandit", "pip-audit"]
+    ignore:
+      # The code uses the 8.x client API (pyproject pins elasticsearch<9).
+      - dependency-name: elasticsearch
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Base image of the Dockerfile.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    ignore:
+      # Stay on the Python minor the image is tested with; bump it deliberately.
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  # Images in docker-compose.yml (Kafka, Elasticsearch, Grafana). Majors change config
+  # formats/APIs (and the Elasticsearch client is 8.x only), so they are done by hand.
+  - package-ecosystem: docker-compose
+    directory: "/"
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]

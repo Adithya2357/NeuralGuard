@@ -1,0 +1,4 @@
+# Grafana app-plugin provisioning. The Elasticsearch datasource is built in, so no plugins
+# are needed; the file exists so the directory is present and Grafana logs no error.
+apiVersion: 1
+apps: []
