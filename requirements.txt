@@ -3,7 +3,7 @@
 # with it (same specifiers). It exists for 'pip install -r' workflows and the Docker
 # image's cached dependency layer; 'pip install .' does not read it.
 kafka-python>=2.0.3
-elasticsearch>=8.12,<9
+elasticsearch>=8.12,<10
 scikit-learn>=1.3
 numpy>=1.24
 joblib>=1.3
