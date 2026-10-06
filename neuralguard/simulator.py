@@ -30,20 +30,22 @@ during attacks. Only the attacker's packets carry the attack label.
 
 * ``port_scan``: one attacker, SYN probes to many distinct ports of one target
   (sequential, shuffled well-known, popular-first or full-range order; raw nmap-style
-  probes from one source port or connect() scans), from ~4 probes/s up to ~800/s.
+  probes or connect() scans), from ~4 probes/s up to ~300/s.
 * ``stealth_scan``: like ``port_scan`` but NULL (no flags), FIN or XMAS (FPU) probes -
   plus nmap's ACK and Maimon (FIN/ACK) scans, whose probes look like ordinary packets.
-* ``syn_flood``: pure SYNs to one target port (mostly 80/443) at 100-1500 pps, usually
-  from spoofed random source IPs, sometimes from a handful of real sources.
-* ``udp_flood``: UDP to random high ports of one target at 150-2000 pps, varied payload
+* ``syn_flood``: pure SYNs to one target port (80 or 443) at 80-600 pps, from spoofed
+  random source IPs or from a handful of real sources.
+* ``udp_flood``: UDP to random high ports of one target at 80-600 pps, varied payload
   sizes; from one source, a small botnet, or reflectors (DNS/NTP/SSDP/memcached
   amplification, so the source port looks like an ordinary service reply).
-* ``icmp_flood``: ICMP echo to one target at 100-1500 pps, small or large payloads, from
+* ``icmp_flood``: ICMP echo to one target at 60-500 pps, small or large payloads, from
   one, a few or spoofed sources.
 
 ``attack_ratio`` is held approximately by scheduling the gap before each episode from
 the records emitted so far. Above ~0.4 the normal activity is thinned so that high
-ratios stay reachable; at 1.0 there is no normal traffic at all.
+ratios stay reachable - more strongly while the running attack fraction lags behind (for
+example while slow scans hold both attack slots); at 1.0 there is no normal traffic at
+all.
 
 Usage::
 
@@ -67,7 +69,7 @@ from heapq import heappop, heappush
 from itertools import product
 from typing import Any
 
-from neuralguard.schema import ATTACK_TYPES, NORMAL_LABEL
+from neuralguard.schema import ATTACK_TYPES, MAX_TIMESTAMP, NORMAL_LABEL
 
 __all__ = ["TrafficSimulator", "generate_records"]
 
@@ -78,6 +80,12 @@ _STEP_SECONDS = 1.0
 
 # Normal-traffic thinning for high attack ratios: intensity = min(1, K * (1 - r) / r).
 _THINNING_K = 0.6
+# Extra thinning while the attack fraction lags a ratio that needs thinning at all: each
+# normal activity starts with probability (achieved / attack_ratio) ** _LAG_POWER, but at
+# least _MIN_KEEP, once _LAG_MIN_RECORDS records have been emitted.
+_LAG_POWER = 3.0
+_MIN_KEEP = 0.05
+_LAG_MIN_RECORDS = 200
 _MEAN_EPISODE_RECORDS = 200  # rough average, only used to size the initial warm-up
 # At most this many attack episodes run at once (each on its own target). Overlap only
 # happens when normal traffic gets ahead of ``attack_ratio`` - e.g. during a slow scan.
@@ -285,9 +293,7 @@ class TrafficSimulator:
             self._schedule_attack(step_start)
             self._spawn_normal(step_start, step_end)
             while pending and pending[0][0] < step_end:
-                ts, _, src, dst, proto, sport, dport, length, ttl, flags, label = heappop(
-                    pending
-                )
+                ts, _, src, dst, proto, sport, dport, length, ttl, flags, label = heappop(pending)
                 if label == NORMAL_LABEL:
                     self._normal_count += 1
                 else:
@@ -759,12 +765,32 @@ class TrafficSimulator:
             self._level = rng.uniform(0.6, 1.5)
             self._level_until = step_start + rng.uniform(20.0, 90.0)
         level = self._level
+        keep = self._normal_keep()
         for row in self._processes:
             next_time, rate, activity, follows_level = row
             while next_time < step_end:
-                activity(next_time)
+                # Thinning a Poisson process by a coin flip per event keeps it Poisson and
+                # takes effect at once (a lower rate would only apply after the next gap).
+                if keep >= 1.0 or rng.random() < keep:
+                    activity(next_time)
                 next_time += rng.expovariate(rate * level if follows_level else rate)
             row[0] = next_time
+
+    def _normal_keep(self) -> float:
+        """Share of normal activities to start now (1.0 unless a high ratio is lagging).
+
+        Only ratios whose normal activity is thinned at all (``_normal_scale < 1``) are
+        affected, so the streams of lower ratios do not depend on it.
+        """
+        if self._normal_scale >= 1.0:
+            return 1.0
+        total = self._normal_count + self._attack_count
+        if total < _LAG_MIN_RECORDS:
+            return 1.0
+        achieved = self._attack_count / total
+        if achieved >= self.attack_ratio:
+            return 1.0
+        return max(_MIN_KEEP, (achieved / self.attack_ratio) ** _LAG_POWER)
 
     # -- TCP building blocks
 
@@ -1319,6 +1345,8 @@ def _validate_start_time(start_time: Any) -> float:
     value = float(start_time)
     if not math.isfinite(value) or value < 0:
         raise ValueError(f"start_time must be a finite, non-negative number, got {start_time}")
+    if value > MAX_TIMESTAMP:  # its records would not be valid (see schema.normalize_record)
+        raise ValueError(f"start_time must be before the year 3000, got {start_time}")
     return value
 
 

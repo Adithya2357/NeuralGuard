@@ -81,8 +81,21 @@ def test_parser_defaults():
     assert detect.threshold is None and detect.model is None
 
     demo = parser.parse_args(["demo"])
-    assert (demo.count, demo.seed, demo.attack_ratio) == (3000, 7, 0.3)
-    assert (demo.train_samples, demo.train_trees) == (20_000, 100)
+    assert (demo.count, demo.seed, demo.attack_ratio) == (6000, 7, 0.3)
+    assert (demo.train_samples, demo.train_trees) == (60_000, 100)
+
+
+def test_default_demo_stream_shows_every_attack_type():
+    """A first-time `neuralguard demo` must showcase all attack types, not just one."""
+    from collections import Counter
+
+    from neuralguard.simulator import TrafficSimulator
+
+    demo = build_parser().parse_args(["demo"])
+    simulator = TrafficSimulator(seed=demo.seed, attack_ratio=demo.attack_ratio)
+    counts = Counter(record["label"] for record in simulator.records(demo.count))
+    for attack in ATTACK_TYPES:
+        assert counts[attack] >= 100, (attack, counts)
 
 
 def test_parser_global_options_and_flags():
@@ -481,9 +494,17 @@ def produce_env(monkeypatch):
         seen["producers"].append(settings)
         return "producer"
 
-    def live_records(interface=None, bpf_filter=None, count=0, stop_event=None):
+    def live_records(
+        interface=None, bpf_filter=None, count=0, stop_event=None, *, exclude_tcp_ports=()
+    ):
         seen["live"].append(
-            {"interface": interface, "bpf_filter": bpf_filter, "count": count, "stop": stop_event}
+            {
+                "interface": interface,
+                "bpf_filter": bpf_filter,
+                "count": count,
+                "stop": stop_event,
+                "exclude": tuple(exclude_tcp_ports),
+            }
         )
         yield from fake_records(count or 3)
 
@@ -498,9 +519,7 @@ def produce_env(monkeypatch):
     monkeypatch.setattr(neuralguard.capture, "live_records", live_records)
     monkeypatch.setattr(neuralguard.capture, "pcap_records", pcap_records)
     monkeypatch.setattr(
-        neuralguard.capture,
-        "default_bpf_filter",
-        lambda settings: f"not (tcp port {settings.kafka_ports[0]})",
+        neuralguard.capture, "default_excluded_ports", lambda settings: settings.kafka_ports
     )
     return seen
 
@@ -552,18 +571,22 @@ def test_produce_live_uses_the_default_bpf_filter(capsys, produce_env):
     assert status == 0
     (call,) = produce_env["live"]
     assert call["interface"] == "eth1" and call["count"] == 4
-    assert call["bpf_filter"] == "not (tcp port 9999)"
+    assert call["bpf_filter"] is None  # capture builds the filter (or filters in Python)
+    assert call["exclude"] == (9999,)  # NeuralGuard's own Kafka traffic stays out
     assert call["stop"] is not None
     assert produce_env["publish"][0]["pace"] is False
     assert len(FakeRecordSink.instances[0].records) == 4
 
 
-def test_produce_live_with_a_custom_filter(capsys, produce_env):
+@pytest.mark.parametrize(("flag", "expected"), [("udp", "udp"), ("", None)])
+def test_produce_live_with_a_custom_filter(capsys, produce_env, flag, expected):
     status, _, _ = run(
-        capsys, "produce", "--source", "live", "--bpf-filter", "udp", "--output", "-"
+        capsys, "produce", "--source", "live", "--bpf-filter", flag, "--output", "-"
     )
     assert status == 0
-    assert produce_env["live"][0]["bpf_filter"] == "udp"
+    (call,) = produce_env["live"]
+    assert call["bpf_filter"] == expected  # '' captures everything
+    assert call["exclude"] == ()  # a filter of the user's own replaces the default
 
 
 def test_produce_pcap_honours_count(capsys, produce_env, tmp_path):
@@ -590,6 +613,18 @@ def test_produce_rejects_options_for_another_source(capsys, produce_env, argv, f
     status, _, err = run(capsys, "produce", "--output", "-", *argv)
     assert status == 2
     assert_one_line_error(err, fragment)
+
+
+def test_produce_with_a_missing_pcap_leaves_the_output_file_alone(capsys, tmp_path):
+    output = tmp_path / "records.jsonl"
+    output.write_text('{"keep": "me"}\n')
+    status, _, err = run(
+        capsys, "produce", "--source", "pcap", "--pcap", str(tmp_path / "missing.pcap"),
+        "--output", str(output),
+    )  # fmt: skip
+    assert status == 2
+    assert_one_line_error(err, "pcap file not found")
+    assert output.read_text() == '{"keep": "me"}\n'
 
 
 def test_produce_capture_error_is_a_one_line_error(capsys, monkeypatch, produce_env):
@@ -648,6 +683,19 @@ def test_demo_summary_without_attacks_reports_n_a():
     text = summary.format()
     assert "n/a (no packets)" in text
     assert "0.0% (0 of 3)" in text
+    assert "Not in this run" not in text  # no attacks at all (e.g. --attack-ratio 0)
+
+
+def test_demo_summary_names_attack_types_missing_from_the_run():
+    summary = DemoSummary()
+    summary.add(
+        [FakeDetection({"label": "normal"}, False, None)] * 3
+        + [FakeDetection({"label": label}, True, label) for label in ATTACK_TYPES[:3]]
+    )
+    (hint,) = [line for line in summary.format().splitlines() if "Not in this run" in line]
+    assert ", ".join(ATTACK_TYPES[3:]) in hint and "--count" in hint
+    summary.add([FakeDetection({"label": label}, True, label) for label in ATTACK_TYPES[3:]])
+    assert "Not in this run" not in summary.format()
 
 
 # ------------------------------------------------------------------- end-to-end tests
@@ -705,15 +753,60 @@ def test_train_with_missing_data_file(capsys, tmp_path):
     assert_one_line_error(err, "missing.jsonl")
 
 
-def test_train_output_that_cannot_be_written(capsys, tmp_path):
+def test_train_output_that_cannot_be_written(capsys, tmp_path, monkeypatch):
+    import neuralguard.train
+
+    def must_not_train(**kwargs):
+        raise AssertionError("training started although the output cannot be written")
+
+    monkeypatch.setattr(neuralguard.train, "train_model", must_not_train)
     blocker = tmp_path / "file"
     blocker.write_text("not a directory")
+    for flags, fragment in (
+        (["--output", str(blocker / "sub" / "m.joblib")], f"Not a directory: {blocker}"),
+        (["--output", str(tmp_path)], f"Is a directory: {tmp_path}"),
+        (["--report-json", str(tmp_path)], f"Is a directory: {tmp_path}"),
+    ):
+        status, out, err = run(capsys, "train", "--samples", "3000", *flags)
+        assert status == 1
+        assert out == ""  # failed before training, not after
+        assert_one_line_error(err, fragment)
+
+
+def test_train_save_failure_after_training_is_a_one_line_error(capsys, tmp_path, monkeypatch):
+    from neuralguard.model import ThreatModel
+
+    def disk_full(self, path):
+        raise OSError(28, "No space left on device", str(path))
+
+    monkeypatch.setattr(ThreatModel, "save", disk_full)
+    target = tmp_path / "m.joblib"
     status, out, err = run(
-        capsys, "train", "--samples", "3000", "--trees", "5", "--output", str(blocker / "m.joblib")
+        capsys, "train", "--samples", "3000", "--trees", "5", "--output", str(target)
     )
     assert status == 1
-    assert "Held-out metrics" in out  # the report is printed before saving
-    assert_one_line_error(err)
+    assert "Held-out metrics" in out  # the report is still printed before saving
+    assert_one_line_error(err, "No space left on device", str(target))
+
+
+@pytest.mark.parametrize("make_target", ["under_a_file", "a_directory"])
+def test_detect_alerts_file_that_cannot_be_opened(capsys, detect_env, tmp_path, make_target):
+    blocker = tmp_path / "file"
+    blocker.write_text("not a directory")
+    if make_target == "under_a_file":
+        target, fragment = blocker / "alerts.jsonl", f"Not a directory: {blocker}"
+    else:
+        target, fragment = tmp_path, f"Is a directory: {tmp_path}"
+    status, _, err = run(capsys, "detect", "--no-elasticsearch", "--alerts-file", str(target))
+    assert status == 1
+    assert_one_line_error(err, fragment)
+    assert detect_env["kafka"] == []  # failed before connecting to Kafka
+
+
+def test_produce_output_that_cannot_be_opened(capsys, tmp_path):
+    status, _, err = run(capsys, "produce", "--count", "3", "--no-pace", "--output", str(tmp_path))
+    assert status == 1
+    assert_one_line_error(err, f"Is a directory: {tmp_path}")
 
 
 def test_demo_trains_an_in_memory_model_when_the_file_is_missing(capsys, caplog, tmp_path):

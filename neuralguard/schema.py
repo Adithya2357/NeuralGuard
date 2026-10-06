@@ -52,6 +52,11 @@ RECORD_FIELDS = (
 _UNKNOWN_IPS = {"", "unknown", "none", "null", "-"}
 _MAX_LENGTH = 1 << 20  # 1 MiB; anything bigger is not a single packet
 
+# Latest plausible capture time: 3000-01-01T00:00:00Z. A later value is corrupt or
+# mis-scaled (e.g. milliseconds instead of seconds); accepting it would jump the feature
+# extractor's clock, which only ever moves forward, far into the future for good.
+MAX_TIMESTAMP = 32_503_680_000.0
+
 
 class InvalidRecordError(ValueError):
     """Raised when a traffic record is malformed."""
@@ -62,7 +67,8 @@ def normalize_record(raw: Mapping[str, Any]) -> dict[str, Any]:
 
     Missing optional fields get defaults (ports/ttl/length 0, flags "", IPs None,
     timestamp = now). Unknown protocols map to "OTHER". Anything that cannot be
-    coerced raises :class:`InvalidRecordError`.
+    coerced raises :class:`InvalidRecordError`, including a timestamp after
+    ``MAX_TIMESTAMP`` (the year 3000), which cannot be a real capture time.
     """
     if not isinstance(raw, Mapping):
         raise InvalidRecordError(f"record must be a JSON object, got {type(raw).__name__}")
@@ -95,6 +101,11 @@ def _timestamp(value: Any) -> float:
     value = float(value)
     if not math.isfinite(value) or value < 0:
         raise InvalidRecordError(f"timestamp must be a finite, non-negative number, got {value}")
+    if value > MAX_TIMESTAMP:
+        hint = " - milliseconds instead of seconds?" if value / 1000 <= MAX_TIMESTAMP else ""
+        raise InvalidRecordError(
+            f"timestamp {value:g} is not a plausible capture time (after the year 3000){hint}"
+        )
     return value
 
 

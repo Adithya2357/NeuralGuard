@@ -27,6 +27,7 @@ from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from neuralguard.config import Settings
+from neuralguard.kafkautil import bootstrap_timeout_options, retryable_kafka_errors
 
 if TYPE_CHECKING:
     # Imported lazily at runtime: they pull in scikit-learn, and this module is also
@@ -36,9 +37,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# kafka-python 2.x raises NoBrokersAvailable when no bootstrap server answers; 3.x
-# raises KafkaTimeoutError ("Unable to bootstrap from ...") or KafkaConnectionError.
-_RETRYABLE_KAFKA_ERRORS = ("NoBrokersAvailable", "KafkaTimeoutError", "KafkaConnectionError")
 _PREVIEW_BYTES = 80
 
 
@@ -57,7 +55,8 @@ def create_kafka_consumer(
     as raw bytes and are decoded with :func:`decode_message` in the loop.
 
     While no broker is reachable the connection is retried ``retries`` more times,
-    ``backoff_seconds`` apart (each attempt is logged); the last error is re-raised.
+    ``backoff_seconds`` apart (each attempt is logged, and with kafka-python 3.x waits at
+    most ``kafkautil.BOOTSTRAP_TIMEOUT_MS``); the last error is re-raised.
     ``consumer_factory`` (default ``kafka.KafkaConsumer``) and ``sleep`` are injectable
     for tests.
     """
@@ -69,7 +68,8 @@ def create_kafka_consumer(
         from kafka import KafkaConsumer
 
         consumer_factory = KafkaConsumer
-    retryable = _retryable_kafka_errors()
+    retryable = retryable_kafka_errors()
+    timeout_options = bootstrap_timeout_options(consumer_factory)
     servers = ",".join(settings.kafka_bootstrap_servers)
     attempt = 1
     while True:
@@ -80,6 +80,7 @@ def create_kafka_consumer(
                 group_id=settings.kafka_group_id,
                 auto_offset_reset="latest",
                 enable_auto_commit=True,
+                **timeout_options,
             )
             break
         except retryable as exc:
@@ -219,24 +220,44 @@ class DetectionService:
 
     def emit_alerts(self, detections: Iterable[Detection]) -> int:
         """Throttle the threats among ``detections`` and send each resulting alert to
-        every sink; returns the number of alerts emitted."""
-        from neuralguard.alerts import build_alert_document
-
+        every sink - plus a summary alert for every (attack type, target) that went
+        quiet with alerts still held back (see :meth:`AlertThrottler.flush`). Returns
+        the number of alerts emitted."""
         emitted = 0
+        latest: float | None = None
         for detection in detections:
+            timestamp = float(detection.record["timestamp"])
+            latest = timestamp if latest is None else max(latest, timestamp)
             if not detection.is_threat:
                 continue
             suppressed = self.throttler.check(detection)
-            if suppressed is None:
-                continue
-            doc = build_alert_document(
-                detection, model_version=self.model_version, suppressed_count=suppressed
-            )
-            for sink in self.sinks:
-                self._guarded(sink, "emit", doc)
+            if suppressed is not None:
+                self._send_alert(detection, suppressed)
+                emitted += 1
+        for detection, suppressed in self.throttler.flush(latest):
+            self._send_alert(detection, suppressed)
             emitted += 1
         self.alerts_emitted += emitted
         return emitted
+
+    def flush_alerts(self) -> int:
+        """Send a summary alert for everything throttling still holds back (on shutdown,
+        or at the end of a replay); returns the number of alerts emitted."""
+        emitted = 0
+        for detection, suppressed in self.throttler.flush(everything=True):
+            self._send_alert(detection, suppressed)
+            emitted += 1
+        self.alerts_emitted += emitted
+        return emitted
+
+    def _send_alert(self, detection: Detection, suppressed: int) -> None:
+        from neuralguard.alerts import build_alert_document
+
+        doc = build_alert_document(
+            detection, model_version=self.model_version, suppressed_count=suppressed
+        )
+        for sink in self.sinks:
+            self._guarded(sink, "emit", doc)
 
     def tick(self) -> None:
         """Let buffering sinks flush, and log a stats line every ``stats_interval``."""
@@ -257,8 +278,8 @@ class DetectionService:
         """Consume until ``stop_event`` is set or ``max_messages`` were consumed.
 
         ``tick()`` runs after every poll. However the loop ends - including by an
-        exception - every sink is flushed and closed and then the consumer is closed.
-        Returns the detector's stats.
+        exception - the alerts throttling still holds back are sent, every sink is
+        flushed and closed and then the consumer is closed. Returns the detector's stats.
         """
         if max_messages is not None and max_messages < 0:
             raise ValueError(f"max_messages must be >= 0, got {max_messages}")
@@ -306,6 +327,10 @@ class DetectionService:
             logger.exception("alert sink %s failed in %s()", type(sink).__name__, method)
 
     def _shutdown(self, consumer: Any) -> None:
+        try:
+            self.flush_alerts()
+        except Exception:  # never skip closing the sinks and the consumer
+            logger.exception("error while sending the held-back alerts")
         for sink in self.sinks:
             self._guarded(sink, "flush")
             self._guarded(sink, "close")
@@ -345,13 +370,6 @@ class DetectionService:
         )
         self._last_stats_time = now
         self._last_stats_messages = self.messages_consumed
-
-
-def _retryable_kafka_errors() -> tuple[type[BaseException], ...]:
-    from kafka import errors
-
-    found = (getattr(errors, name, None) for name in _RETRYABLE_KAFKA_ERRORS)
-    return tuple(cls for cls in found if isinstance(cls, type))
 
 
 def _preview(value: Any) -> str:

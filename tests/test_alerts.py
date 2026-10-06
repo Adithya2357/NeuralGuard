@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import math
 import time
@@ -133,7 +134,11 @@ def test_detected_at_defaults_to_current_time():
 
 
 def test_unrepresentable_packet_time_falls_back_to_detection_time():
-    doc = build_alert_document(detection(ts=1e20), model_version="v", now=NOW)
+    # normalize_record rejects such times, but a Detection assembled some other way must
+    # still produce a document instead of crashing the detector loop.
+    det = detection()
+    det = dataclasses.replace(det, record={**det.record, "timestamp": 1e20})
+    doc = build_alert_document(det, model_version="v", now=NOW)
     assert doc["@timestamp"] == doc["detected_at"] == "2024-11-03T15:30:05.500Z"
 
 
@@ -260,6 +265,77 @@ def test_non_threat_is_never_alerted_nor_counted():
     assert AlertThrottler(cooldown_seconds=0).check(detection(is_threat=False)) is None
     assert throttler.suppressed_total == 0
     assert throttler.check(detection()) == 0
+
+
+def test_flush_reports_the_held_back_tail_once_the_cooldown_is_over():
+    throttler = AlertThrottler(cooldown_seconds=5.0)
+    assert throttler.check(detection(ts=100.0)) == 0
+    tail = [detection(ts=100.0 + i, score=0.5 + i / 10) for i in (1, 2, 3)]
+    assert all(throttler.check(d) is None for d in tail)
+    assert throttler.flush(now=104.9) == []  # the flood may still go on
+    ((latest, suppressed),) = throttler.flush(now=105.0)
+    assert latest is tail[-1] and suppressed == 2  # the latest one, plus 2 before it
+    assert throttler.flush(now=106.0) == []  # reported once
+    # The summary counts as an alert at its own packet time (103).
+    assert throttler.check(detection(ts=107.0)) is None
+    assert throttler.check(detection(ts=108.0)) == 1
+
+
+def test_flush_everything_at_shutdown_and_forget_quiet_keys():
+    throttler = AlertThrottler(cooldown_seconds=60.0)
+    assert throttler.check(detection(ts=0.0, dst="10.0.0.1")) == 0
+    assert throttler.check(detection(ts=1.0, dst="10.0.0.1")) is None
+    assert throttler.check(detection(ts=2.0, dst="10.0.0.2")) == 0
+    assert throttler.flush(now=3.0) == []
+    summaries = throttler.flush(everything=True)
+    assert [(d.record["destination_ip"], n) for d, n in summaries] == [("10.0.0.1", 0)]
+    assert throttler.flush(now=1000.0) == []
+    assert throttler.tracked_keys == 0  # expired, nothing held back: nothing to remember
+
+
+def test_flush_accounts_for_every_threat_exactly_once():
+    import random
+
+    rng = random.Random(3)
+    throttler = AlertThrottler(cooldown_seconds=5.0)
+    threats = accounted = alerts = 0
+    ts = 0.0
+    for _ in range(3000):
+        ts += rng.expovariate(20.0)
+        det = detection(ts=ts, dst=f"10.0.0.{rng.randint(1, 6)}", attack_type="syn_flood")
+        threats += 1
+        results = [throttler.check(det)]
+        if rng.random() < 0.05:  # the service flushes after every batch
+            results += [n for _, n in throttler.flush(now=ts)]
+        for result in results:
+            if result is not None:
+                alerts += 1
+                accounted += 1 + result
+    for _, n in throttler.flush(everything=True):
+        alerts += 1
+        accounted += 1 + n
+    assert accounted == threats
+    assert alerts + throttler.suppressed_total == threats
+    assert throttler.suppressed_total > 0
+
+
+def test_flush_finds_expired_keys_wherever_they_sit():
+    throttler = AlertThrottler(cooldown_seconds=5.0)
+    assert throttler.check(detection(ts=0.0, dst="10.0.0.1")) == 0
+    assert throttler.check(detection(ts=0.5, dst="10.0.0.1")) is None
+    assert throttler.check(detection(ts=1.0, dst="10.0.0.2")) == 0
+    (summary,) = throttler.flush(now=5.2)  # 10.0.0.1 summarised at 0.5, moved behind .2
+    assert summary[0].record["timestamp"] == 0.5
+    assert throttler.check(detection(ts=5.3, dst="10.0.0.1")) is None  # within 0.5 + 5
+    # 10.0.0.1 is now after 10.0.0.2 in the table, but expires first.
+    ((latest, suppressed),) = throttler.flush(now=5.8)
+    assert latest.record["timestamp"] == 5.3 and suppressed == 0
+
+
+def test_flush_with_throttling_disabled():
+    throttler = AlertThrottler(cooldown_seconds=0)
+    throttler.check(detection())
+    assert throttler.flush(now=1e9) == [] and throttler.flush(everything=True) == []
 
 
 def test_max_keys_drops_oldest_when_none_expired():

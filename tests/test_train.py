@@ -334,7 +334,12 @@ def test_train_model_validates_parameters(data_file, kwargs, message):
 
 
 def fake_simulated_dataset(calls):
-    """Stand-in for simulated_dataset: synthetic separable arrays, records the calls."""
+    """Stand-in for simulated_dataset: synthetic separable arrays, records the calls.
+
+    The classes are separated in *every* column, so each split of each tree separates
+    them and even a 4-tree forest is exactly right (with one informative column out of
+    21, a few trees fit the noise and accuracy drops just below 1.0).
+    """
 
     def fake(n_samples, *, seed, attack_ratio, window_seconds, start_time=1_700_000_000.0):
         calls.append(
@@ -343,7 +348,7 @@ def fake_simulated_dataset(calls):
         rng = np.random.default_rng(seed)
         y = ["normal" if i % 3 else "syn_flood" for i in range(n_samples)]
         X = rng.normal(0, 0.3, size=(n_samples, N_FEATURES))
-        X[:, 0] += [5.0 if label == "syn_flood" else 0.0 for label in y]
+        X += np.array([[5.0] if label == "syn_flood" else [0.0] for label in y])
         return X, y
 
     return fake

@@ -17,6 +17,9 @@ contains plain Python types - never numpy scalars - so any JSON encoder accepts 
 :class:`AlertThrottler` keeps alert volume sane: during a flood *every* packet is a
 detection, but one alert per (attack type, target) every few seconds - carrying the
 number of alerts it stands for - is what an analyst (and Elasticsearch) can cope with.
+:meth:`AlertThrottler.flush` reports what is still held back once a key goes quiet (and
+at shutdown), so every threat is accounted for exactly once: summed over all alerts,
+``1 + suppressed_count`` equals the number of threat detections.
 """
 
 from __future__ import annotations
@@ -89,11 +92,12 @@ def throttle_key(detection: Detection) -> ThrottleKey:
 
 
 class _KeyState:
-    __slots__ = ("last_emitted", "suppressed")
+    __slots__ = ("last_emitted", "latest_suppressed", "suppressed")
 
     def __init__(self, last_emitted: float) -> None:
         self.last_emitted = last_emitted
         self.suppressed = 0
+        self.latest_suppressed: Detection | None = None
 
 
 class AlertThrottler:
@@ -121,7 +125,8 @@ class AlertThrottler:
 
     @property
     def suppressed_total(self) -> int:
-        """Alerts suppressed since this throttler was created."""
+        """Threats suppressed since this throttler was created, not counting those that
+        :meth:`flush` later turned into alerts (so alerts + this = threats)."""
         return self._suppressed_total
 
     @property
@@ -148,6 +153,7 @@ class AlertThrottler:
         state = self._keys.get(key)
         if state is not None and timestamp - state.last_emitted < self.cooldown_seconds:
             state.suppressed += 1
+            state.latest_suppressed = detection
             self._suppressed_total += 1
             return None
 
@@ -156,6 +162,38 @@ class AlertThrottler:
         self._keys.move_to_end(key)
         self._prune()
         return suppressed
+
+    def flush(
+        self, now: float | None = None, *, everything: bool = False
+    ) -> list[tuple[Detection, int]]:
+        """Alerts still held back, for keys whose cooldown is over (or all with
+        ``everything``, e.g. at shutdown).
+
+        Without this, the suppressed tail of a flood that has ended would never be
+        reported. Returns ``(detection, suppressed_count)`` pairs: the latest suppressed
+        detection of a key, to be sent as an alert standing for ``suppressed_count``
+        others suppressed before it. Its key then counts as alerted at that detection's
+        time. ``now`` is the latest packet time seen (also non-threat packets), which
+        decides whose cooldown is over. Expired keys with nothing held back are
+        forgotten.
+        """
+        if now is not None:
+            self._latest = max(self._latest, float(now))
+        expiry = self._latest - self.cooldown_seconds
+        summaries: list[tuple[Detection, int]] = []
+        for key in list(self._keys):
+            state = self._keys[key]
+            if not everything and state.last_emitted > expiry:
+                continue
+            detection = state.latest_suppressed
+            if detection is None:
+                del self._keys[key]  # nothing held back, and its cooldown is over
+                continue
+            summaries.append((detection, state.suppressed - 1))
+            self._suppressed_total -= 1  # that one is an alert now
+            self._keys[key] = _KeyState(float(detection.record["timestamp"]))
+            self._keys.move_to_end(key)
+        return summaries
 
     def _prune(self) -> None:
         keys = self._keys
