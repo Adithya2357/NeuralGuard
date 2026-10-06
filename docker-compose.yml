@@ -1,0 +1,159 @@
+# NeuralGuard local stack: Kafka (KRaft) + Elasticsearch + Grafana.
+#
+#   docker compose up -d                      # infrastructure only (or: make up)
+#   docker compose --profile demo up --build  # + detector and traffic simulator containers
+#
+# Grafana: http://127.0.0.1:3000 (admin / $GRAFANA_ADMIN_PASSWORD, default "admin")
+#
+# SECURITY: every port is published on 127.0.0.1 only, so nothing here is reachable
+# from other machines. Keep it that way - Kafka and Elasticsearch below run WITHOUT
+# authentication. Do not change these to "9200:9200" (which binds 0.0.0.0).
+
+name: neuralguard
+
+x-neuralguard-app: &neuralguard-app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: neuralguard:0.2.0
+  profiles: ["demo"]
+  restart: on-failure
+  environment: &neuralguard-env
+    NEURALGUARD_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    NEURALGUARD_KAFKA_TOPIC: network-traffic
+    NEURALGUARD_LOG_LEVEL: INFO
+
+services:
+  kafka:
+    image: apache/kafka:3.9.1
+    hostname: kafka
+    ports:
+      # External listener for tools on the host (neuralguard produce/detect, kcat, ...).
+      - "127.0.0.1:9092:9092"
+    environment:
+      # Single-node KRaft: this one process is both broker and controller (no ZooKeeper).
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # PLAINTEXT      -> kafka:29092     for other containers on the compose network
+      # PLAINTEXT_HOST -> localhost:9092  for clients on the host
+      # CONTROLLER     -> kafka:29093     KRaft quorum traffic (never published)
+      KAFKA_LISTENERS: PLAINTEXT://:29092,CONTROLLER://:29093,PLAINTEXT_HOST://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # The "network-traffic" topic is created on first use.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+      # One broker, so every internal topic can only have one replica.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Keep a day of traffic; this is a demo, not an archive.
+      KAFKA_LOG_RETENTION_HOURS: 24
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  elasticsearch:
+    image: elasticsearch:8.19.3
+    ports:
+      - "127.0.0.1:9200:9200"
+    environment:
+      discovery.type: single-node
+      cluster.name: neuralguard
+      # !!! LOCAL DEVELOPMENT ONLY !!!
+      # Security (authentication + TLS) is DISABLED so the stack works out of the box.
+      # Anyone who can reach port 9200 can read and delete every document. That is why
+      # the port is bound to 127.0.0.1 above - never expose this container as-is.
+      # To enable security: set xpack.security.enabled to "true", set ELASTIC_PASSWORD
+      # (and, for TLS, xpack.security.http.ssl.*), switch NEURALGUARD_ES_HOSTS to https://,
+      # set NEURALGUARD_ES_USERNAME/NEURALGUARD_ES_PASSWORD (or NEURALGUARD_ES_API_KEY) and
+      # NEURALGUARD_ES_CA_CERTS, and add basicAuth/TLS settings to the Grafana datasource in
+      # deploy/grafana/provisioning/datasources/elasticsearch.yml.
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms1g -Xmx1g
+      # Dev laptops often have nearly full disks; do not let the disk watermarks turn the
+      # index read-only. Remove this outside local development.
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -fsS "http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s" > /dev/null || exit 1
+      interval: 10s
+      timeout: 10s
+      retries: 18
+      start_period: 30s
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      # Do not download the optional "preinstalled" app plugins from grafana.com at startup.
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/threat_dashboard.json
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O /dev/null http://localhost:3000/api/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  # ---- demo profile: the NeuralGuard containers (docker compose --profile demo up) ----
+
+  detector:
+    <<: *neuralguard-app
+    command: ["detect"]
+    environment:
+      <<: *neuralguard-env
+      NEURALGUARD_ES_HOSTS: http://elasticsearch:9200
+      NEURALGUARD_ES_INDEX: threat-detection
+    depends_on:
+      kafka:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+
+  simulator:
+    <<: *neuralguard-app
+    command: ["produce", "--source", "simulate", "--attack-ratio", "0.2"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+volumes:
+  kafka-data:
+  es-data:
+  grafana-data:

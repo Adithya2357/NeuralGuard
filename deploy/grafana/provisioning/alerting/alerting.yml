@@ -1,0 +1,3 @@
+# Grafana alerting provisioning (contact points, alert rules, ...). Nothing is provisioned
+# yet; the file exists so the directory is present and Grafana logs no provisioning error.
+apiVersion: 1
