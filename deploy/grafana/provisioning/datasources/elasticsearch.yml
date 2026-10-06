@@ -1,0 +1,26 @@
+# Grafana datasource for the NeuralGuard alert index (provisioned at startup).
+# The dashboard refers to it by uid ("neuralguard-es"), so keep the uid stable.
+#
+# The local compose stack runs Elasticsearch with security disabled. If you enable it,
+# add credentials here, e.g.
+#   basicAuth: true
+#   basicAuthUser: neuralguard_grafana
+#   secureJsonData:
+#     basicAuthPassword: ${NEURALGUARD_GRAFANA_ES_PASSWORD}
+# and switch the url to https:// (plus jsonData.tlsAuthWithCACert / secureJsonData.tlsCACert).
+apiVersion: 1
+
+datasources:
+  - name: NeuralGuard Elasticsearch
+    uid: neuralguard-es
+    type: elasticsearch
+    access: proxy
+    url: http://elasticsearch:9200
+    isDefault: true
+    editable: false
+    jsonData:
+      index: threat-detection
+      timeField: "@timestamp"
+      logLevelField: severity
+      logMessageField: attack_type
+      maxConcurrentShardRequests: 5

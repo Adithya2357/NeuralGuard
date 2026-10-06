@@ -1,0 +1,8 @@
+# Development tools (mirrors the "dev" extra in pyproject.toml, the source of truth).
+# Equivalent to: pip install -e ".[dev]"
+-r requirements.txt
+pytest>=8
+pytest-cov>=5
+ruff>=0.6
+bandit>=1.7
+pip-audit>=2.7
