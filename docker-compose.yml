@@ -25,7 +25,7 @@ x-neuralguard-app: &neuralguard-app
 
 services:
   kafka:
-    image: apache/kafka:3.9.1
+    image: apache/kafka:3.9.2
     hostname: kafka
     ports:
       # External listener for tools on the host (neuralguard produce/detect, kcat, ...).
