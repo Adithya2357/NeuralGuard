@@ -100,7 +100,7 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:12.2.0
+    image: grafana/grafana:12.4.12
     ports:
       - "127.0.0.1:3000:3000"
     environment:
