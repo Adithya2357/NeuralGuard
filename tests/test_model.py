@@ -85,9 +85,16 @@ def test_train_sets_single_threaded_estimator_and_forest_params(dataset):
     model = ThreatModel.train(X, y, window_seconds=10, n_estimators=5, random_state=0, n_jobs=-1)
     params = model.estimator.get_params()
     assert model.estimator.n_jobs == 1
-    assert params["class_weight"] == "balanced_subsample"
+    assert params["class_weight"] is None  # balanced weights caused false-alert storms
     assert params["min_samples_leaf"] == 2
     assert params["n_estimators"] == 5
+
+
+def test_threat_scores_match_predictions(trained, dataset):
+    X, _ = dataset
+    scores = trained.threat_scores(X)
+    assert scores.shape == (len(X),)
+    assert scores.tolist() == [p.threat_score for p in trained.predict(X)]
 
 
 def test_train_metadata(trained):

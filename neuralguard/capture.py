@@ -5,11 +5,12 @@
   an IP or ARP layer carry no useful signal and are skipped.
 * :func:`live_records` sniffs a live interface (needs root or ``CAP_NET_RAW``).
 * :func:`pcap_records` reads a ``.pcap`` / ``.pcapng`` file.
-* :func:`default_excluded_ports` / :func:`default_bpf_filter` keep the sniffer off
+* :func:`default_exclusions` / :func:`default_bpf_filter` keep the sniffer off
   NeuralGuard's own Kafka and Elasticsearch connections, which would otherwise form a
   feedback loop (every published record would generate more captured packets).
-  ``live_records(exclude_tcp_ports=...)`` drops that traffic in the kernel when libpcap
-  is installed (scapy needs it to compile BPF filters) and in Python otherwise.
+  ``live_records(exclude_tcp_endpoints=..., exclude_tcp_ports=...)`` drops that traffic
+  in the kernel when libpcap is installed (scapy needs it to compile BPF filters) and in
+  Python otherwise.
 
 scapy is imported lazily inside the functions, never at module import time: it is slow
 to import, noisy, and not needed by the detector or the trainer.
@@ -18,6 +19,7 @@ to import, noisy, and not needed by the detector or the trainer.
 from __future__ import annotations
 
 import functools
+import ipaddress
 import logging
 import queue
 import socket
@@ -25,7 +27,7 @@ import sys
 import threading
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from neuralguard.config import Settings
 from neuralguard.schema import InvalidRecordError, normalize_record
@@ -37,13 +39,26 @@ logger = logging.getLogger(__name__)
 # letting memory grow without bound.
 _MAX_QUEUED_PACKETS = 10_000
 _POLL_SECONDS = 0.25  # how often live_records() checks stop_event and the sniffer
-_PRIVILEGE_HINT = "live capture needs root or the CAP_NET_RAW capability (e.g. run it with sudo)"
+_PRIVILEGE_HINT = (
+    "live capture needs root or the CAP_NET_RAW capability (e.g. run it with sudo); in a "
+    "container, run it as root (docker run --user root --network host ...): --cap-add "
+    "NET_RAW alone does not give a non-root user the capability"
+)
 _LIBPCAP_HINT = "scapy needs libpcap to compile BPF filters (e.g. apt install libpcap0.8)"
 _PACKET_OUTGOING = getattr(socket, "PACKET_OUTGOING", 4)  # linux/if_packet.h
+# Record lengths are untagged Ethernet II frame sizes: header + IP packet; ARP over
+# Ethernet is always 14 + 28 bytes.
+_ETHERNET_HEADER = 14
+_ARP_FRAME = 42
 
 
 class CaptureError(RuntimeError):
     """Raised when packets cannot be captured or read."""
+
+
+class CaptureStoppedError(CaptureError):
+    """Raised when a running live capture stops by itself, e.g. because its interface
+    went down or was removed: a failure at run time, not a configuration problem."""
 
 
 # --------------------------------------------------------------------------- parsing
@@ -52,11 +67,13 @@ class CaptureError(RuntimeError):
 def parse_packet(packet: Any) -> dict[str, Any] | None:
     """The canonical traffic record for one scapy packet, or ``None`` to skip it.
 
-    ``timestamp`` is the capture time (``packet.time``) and ``length`` the frame size
-    (``len(packet)``). IPv4 TTL / IPv6 hop limit become ``ttl``; ports and TCP flags
-    come from the first TCP or UDP header. ARP records carry the protocol addresses
-    (``psrc`` / ``pdst``) and no ports or TTL. A packet that does not make a valid
-    record is logged at DEBUG and skipped.
+    ``timestamp`` is the capture time (``packet.time``). ``length`` is the size of the
+    untagged Ethernet II frame that carries the packet, computed from the IP header's own
+    length: the convention of the simulator and so of the model, whatever the capture's
+    link layer (VLAN tags, Linux cooked capture, raw IP) or Ethernet padding. IPv4 TTL /
+    IPv6 hop limit become ``ttl``; ports and TCP flags come from the first TCP or UDP
+    header. ARP records carry the protocol addresses (``psrc`` / ``pdst``) and no ports
+    or TTL. A packet that does not make a valid record is logged at DEBUG and skipped.
     """
     from scapy.layers.inet import IP
     from scapy.layers.inet6 import IPv6
@@ -80,11 +97,30 @@ def parse_packet(packet: Any) -> dict[str, Any] | None:
     raw.setdefault("tcp_flags", "")
     try:
         raw["timestamp"] = float(packet.time)
-        raw["length"] = len(packet)
+        raw["length"] = _frame_length(packet)
         return normalize_record(raw)
     except (InvalidRecordError, TypeError, ValueError) as exc:
         logger.debug("skipping packet that does not make a valid record: %s", exc)
         return None
+
+
+def _frame_length(packet: Any) -> int:
+    """Size of the untagged Ethernet II frame carrying the packet's IP (or ARP) layer.
+
+    It comes from the IP header's own length, so a VLAN tag, a Linux cooked or raw-IP
+    link layer, or Ethernet padding does not change it.
+    """
+    from scapy.layers.inet import IP
+    from scapy.layers.inet6 import IPv6
+
+    if packet.haslayer(IP):
+        ip = packet[IP]
+        # 0 or None: segmentation offload, or a packet built in Python - measure it.
+        return _ETHERNET_HEADER + (ip.len or len(ip))
+    if packet.haslayer(IPv6):
+        ip6 = packet[IPv6]
+        return _ETHERNET_HEADER + (40 + ip6.plen if ip6.plen else len(ip6))
+    return _ARP_FRAME
 
 
 def _transport(ip_layer: Any) -> dict[str, Any]:
@@ -124,21 +160,69 @@ def _load_dissectors() -> None:
     import scapy.layers.l2  # noqa: F401
 
 
-def default_excluded_ports(settings: Settings) -> tuple[int, ...]:
-    """TCP ports of NeuralGuard's own Kafka and Elasticsearch connections, each once."""
-    return tuple(dict.fromkeys((*settings.kafka_ports, *settings.es_ports)))
+class Exclusions(NamedTuple):
+    """TCP traffic a live capture leaves out: NeuralGuard's own connections."""
+
+    endpoints: tuple[tuple[str, int], ...] = ()  # (ip, port) of a service it talks to
+    ports: tuple[int, ...] = ()  # left out on any address (hosts that did not resolve)
+
+    def describe(self) -> str:
+        """E.g. ``"127.0.0.1:9092, [::1]:9092, port 9200"``."""
+        parts = [f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}" for ip, port in self.endpoints]
+        return ", ".join([*parts, *(f"port {port}" for port in self.ports)]) or "nothing"
 
 
-def default_bpf_filter(settings: Settings) -> str:
-    """A BPF filter excluding NeuralGuard's own Kafka and Elasticsearch traffic.
+def default_exclusions(
+    settings: Settings, *, resolve: Callable[..., Any] = socket.getaddrinfo
+) -> Exclusions:
+    """NeuralGuard's own Kafka and Elasticsearch connections, to keep out of a capture.
 
-    For the defaults that is ``"not (tcp port 9092 or tcp port 9200)"``.
+    Every configured Kafka bootstrap server and Elasticsearch host is resolved
+    (``resolve`` is injectable for tests), and only TCP packets from or to exactly one of
+    those ``(ip, port)`` pairs are left out. Traffic that merely uses port 9092 or 9200 -
+    say, a scan sent from source port 9092 to hide from the sensor - is still captured. A
+    host name that does not resolve falls back to its port on every address, with a
+    warning. Kafka brokers missing from the bootstrap list are not excluded: list them all.
     """
-    return _exclusion_filter(default_excluded_ports(settings))
+    endpoints: dict[tuple[str, int], None] = {}
+    ports: dict[int, None] = {}
+    for host, port in (*settings.kafka_endpoints, *settings.es_endpoints):
+        try:
+            infos = resolve(host, port, type=socket.SOCK_STREAM)
+        except (OSError, UnicodeError) as exc:  # socket.gaierror is an OSError
+            logger.warning(
+                "cannot resolve %s (%s): TCP port %d is left out of the capture on every address",
+                host,
+                exc,
+                port,
+            )
+            ports[port] = None
+            continue
+        for info in infos:
+            try:  # sockaddr[0]; link-local IPv6 may carry a zone id ("fe80::1%eth0")
+                ip = str(ipaddress.ip_address(str(info[4][0]).split("%", 1)[0]))
+            except ValueError:
+                continue
+            endpoints[(ip, port)] = None
+    return Exclusions(tuple(endpoints), tuple(ports))
 
 
-def _exclusion_filter(ports: Iterable[int]) -> str:
-    return "not (" + " or ".join(f"tcp port {port}" for port in ports) + ")"
+def default_bpf_filter(
+    settings: Settings, *, resolve: Callable[..., Any] = socket.getaddrinfo
+) -> str | None:
+    """A BPF filter excluding NeuralGuard's own Kafka and Elasticsearch traffic (see
+    :func:`default_exclusions`), e.g. ``"not ((src host 127.0.0.1 and tcp src port 9092)
+    or (dst host 127.0.0.1 and tcp dst port 9092) or ...)"``."""
+    return _exclusion_filter(default_exclusions(settings, resolve=resolve))
+
+
+def _exclusion_filter(exclusions: Exclusions) -> str | None:
+    terms = [
+        f"(src host {ip} and tcp src port {port}) or (dst host {ip} and tcp dst port {port})"
+        for ip, port in exclusions.endpoints
+    ]
+    terms += [f"tcp port {port}" for port in exclusions.ports]
+    return "not (" + " or ".join(terms) + ")" if terms else None
 
 
 def _bpf_supported() -> bool:
@@ -159,6 +243,7 @@ def live_records(
     count: int = 0,
     stop_event: threading.Event | None = None,
     *,
+    exclude_tcp_endpoints: Iterable[tuple[str, int]] = (),
     exclude_tcp_ports: Iterable[int] = (),
     sniffer_factory: Callable[..., Any] | None = None,
     poll_seconds: float = _POLL_SECONDS,
@@ -167,13 +252,15 @@ def live_records(
 
     A ``scapy.sendrecv.AsyncSniffer`` (``store=False``) feeds a queue in its own thread;
     packets that :func:`parse_packet` skips do not count. Iteration ends after ``count``
-    records (0 = unlimited), once ``stop_event`` is set (checked at least every
-    ``poll_seconds``) or when the sniffer stops by itself; the sniffer is always stopped
-    when the iterator finishes or is closed.
+    records (0 = unlimited) or once ``stop_event`` is set (checked at least every
+    ``poll_seconds``); the sniffer is always stopped when the iterator finishes or is
+    closed. A sniffer that stops by itself - its socket failed, e.g. the link went down -
+    raises :class:`CaptureStoppedError`, so a supervisor sees the capture fail.
 
-    TCP packets from or to ``exclude_tcp_ports`` (see :func:`default_excluded_ports`) are
-    never yielded. Without a ``bpf_filter`` that exclusion also becomes the kernel BPF
-    filter when libpcap is installed; without libpcap it is applied in Python only (a
+    TCP packets from or to one of the ``(ip, port)`` pairs of ``exclude_tcp_endpoints``,
+    or from or to any address on ``exclude_tcp_ports`` (see :func:`default_exclusions`),
+    are never yielded. Without a ``bpf_filter`` that exclusion also becomes the kernel
+    BPF filter when libpcap is installed; without libpcap it is applied in Python only (a
     warning says so). A ``bpf_filter`` given without libpcap raises
     :class:`CaptureError`, as does a capture that is not permitted (needs root /
     ``CAP_NET_RAW``) or fails. ``sniffer_factory`` (default ``AsyncSniffer``) is
@@ -183,18 +270,22 @@ def live_records(
         raise ValueError(f"count must be a non-negative integer, got {count!r}")
     if poll_seconds <= 0:
         raise ValueError(f"poll_seconds must be > 0, got {poll_seconds}")
-    excluded = tuple(dict.fromkeys(int(port) for port in exclude_tcp_ports))
-    if any(not 0 < port <= 65535 for port in excluded):
-        raise ValueError(f"exclude_tcp_ports must be TCP ports (1-65535), got {excluded}")
+    excluded = Exclusions(
+        tuple(dict.fromkeys((_canonical_ip(ip), int(port)) for ip, port in exclude_tcp_endpoints)),
+        tuple(dict.fromkeys(int(port) for port in exclude_tcp_ports)),
+    )
+    ports = (*excluded.ports, *(port for _, port in excluded.endpoints))
+    if any(not 0 < port <= 65535 for port in ports):
+        raise ValueError(f"excluded TCP ports must be 1-65535, got {excluded}")
     _load_dissectors()
-    kernel_filter = bpf_filter or (_exclusion_filter(excluded) if excluded else None)
+    kernel_filter = bpf_filter or _exclusion_filter(excluded)
     if kernel_filter and not _bpf_supported():
         if bpf_filter:
             raise CaptureError(f"cannot apply the BPF filter {bpf_filter!r}: {_LIBPCAP_HINT}")
         logger.warning(
-            "libpcap is not installed, so NeuralGuard's own traffic (TCP ports %s) is "
-            "filtered out in Python instead of the kernel; %s",
-            ", ".join(map(str, excluded)),
+            "libpcap is not installed, so NeuralGuard's own traffic (TCP %s) is filtered "
+            "out in Python instead of the kernel; %s",
+            excluded.describe(),
             _LIBPCAP_HINT,
         )
         kernel_filter = None
@@ -209,7 +300,8 @@ def live_records(
     return _live_records(
         interface,
         kernel_filter,
-        frozenset(excluded),
+        frozenset(excluded.endpoints),
+        frozenset(excluded.ports),
         count,
         stop_event,
         sniffer_factory,
@@ -262,7 +354,8 @@ def _inbound_listen_socket() -> type:
 def _live_records(
     interface: str | None,
     bpf_filter: str | None,
-    excluded: frozenset[int],
+    excluded_endpoints: frozenset[tuple[str, int]],
+    excluded_ports: frozenset[int],
     count: int,
     stop_event: threading.Event | None,
     sniffer_factory: Callable[..., Any],
@@ -270,6 +363,7 @@ def _live_records(
     extra_options: dict[str, Any],
 ) -> Iterator[dict[str, Any]]:
     packets: queue.Queue[Any] = queue.Queue(maxsize=_MAX_QUEUED_PACKETS)
+    started = threading.Event()
     dropped = 0
 
     def enqueue(packet: Any) -> None:  # runs in the sniffer thread
@@ -281,7 +375,12 @@ def _live_records(
             if dropped == 1:
                 logger.warning("capture queue full: dropping packets until it drains")
 
-    options: dict[str, Any] = {"prn": enqueue, "store": False, **extra_options}
+    options: dict[str, Any] = {
+        "prn": enqueue,
+        "store": False,
+        "started_callback": started.set,
+        **extra_options,
+    }
     if interface:
         options["iface"] = interface
     if bpf_filter:
@@ -294,17 +393,22 @@ def _live_records(
             sniffer.start()
         except OSError as exc:  # PermissionError is an OSError
             raise _capture_error(exc, where) from exc
+        _wait_until_started(sniffer, started, where, poll_seconds)
         logger.info("capturing on %s (filter: %s)", where, bpf_filter or "none")
         while not _stopped(stop_event):
             try:
                 packet = packets.get(timeout=poll_seconds)
             except queue.Empty:
-                if not _sniffer_alive(sniffer, where):
-                    logger.info("the packet sniffer on %s stopped", where)
-                    return
+                if not _sniffer_alive(sniffer, where) and not _stopped(stop_event):
+                    # It is never asked to end by itself (no count, no timeout): scapy
+                    # ends the thread, with only a warning, once its socket has failed.
+                    raise CaptureStoppedError(
+                        f"packet capture on {where} stopped unexpectedly "
+                        "(interface down or removed?)"
+                    ) from None
                 continue
             record = parse_packet(packet)
-            if record is None or _is_excluded(record, excluded):
+            if record is None or _is_excluded(record, excluded_endpoints, excluded_ports):
                 continue
             yield record
             yielded += 1
@@ -321,12 +425,37 @@ def _stopped(stop_event: threading.Event | None) -> bool:
     return stop_event is not None and stop_event.is_set()
 
 
-def _is_excluded(record: dict[str, Any], ports: frozenset[int]) -> bool:
+def _wait_until_started(
+    sniffer: Any, started: threading.Event, where: str, poll_seconds: float
+) -> None:
+    """Wait until the sniffer thread has opened its socket and is capturing.
+
+    Until then ``AsyncSniffer.stop()`` does nothing: a sniffer stopped that early would
+    start capturing afterwards and never end. Raises :class:`CaptureError` when the
+    capture fails to start.
+    """
+    while not started.wait(poll_seconds):
+        if not _sniffer_alive(sniffer, where):  # raises if it ended with an error
+            raise CaptureError(f"packet capture on {where} ended before it started")
+
+
+def _is_excluded(
+    record: dict[str, Any], endpoints: frozenset[tuple[str, int]], ports: frozenset[int]
+) -> bool:
+    if record["protocol"] != "TCP":
+        return False
+    sport, dport = record["source_port"], record["destination_port"]
     return (
-        bool(ports)
-        and record["protocol"] == "TCP"
-        and (record["source_port"] in ports or record["destination_port"] in ports)
+        (record["source_ip"], sport) in endpoints
+        or (record["destination_ip"], dport) in endpoints
+        or sport in ports
+        or dport in ports
     )
+
+
+def _canonical_ip(ip: str) -> str:
+    """``ip`` the way records spell it (``ValueError`` if it is not an IP address)."""
+    return str(ipaddress.ip_address(ip))
 
 
 def _sniffer_alive(sniffer: Any, where: str) -> bool:

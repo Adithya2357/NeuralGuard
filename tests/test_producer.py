@@ -72,8 +72,8 @@ class FakeProducer:
     def flush(self):
         self.calls.append("flush")
 
-    def close(self):
-        self.calls.append("close")
+    def close(self, timeout=None):
+        self.calls.append(("close", timeout))
 
 
 class RecordingSink:
@@ -151,22 +151,24 @@ def test_kafka_sink_flush_and_close():
     sink = KafkaRecordSink(producer, "t")
     sink.flush()
     assert producer.calls == ["flush"]
-    sink.close()
-    assert producer.calls == ["flush", "flush", "close"]
+    sink.close()  # kafka-python's close() flushes itself: no second wait
+    assert producer.calls == ["flush", ("close", None)]
     sink.close()  # idempotent
-    assert producer.calls == ["flush", "flush", "close"]
+    assert producer.calls == ["flush", ("close", None)]
 
 
-def test_kafka_sink_close_closes_even_if_flush_fails():
+def test_kafka_sink_close_with_a_timeout_drops_undelivered_records(caplog):
     producer = FakeProducer()
 
-    def broken_flush():
-        raise kafka.errors.KafkaTimeoutError("flush timed out")
+    def close(timeout=None):  # what kafka-python does when records are still pending
+        producer.calls.append(("close", timeout))
+        raise kafka.errors.KafkaTimeoutError("Timeout waiting for future")
 
-    producer.flush = broken_flush
-    with pytest.raises(kafka.errors.KafkaTimeoutError):
-        KafkaRecordSink(producer, "t").close()
-    assert producer.calls == ["close"]
+    producer.close = close
+    with caplog.at_level(logging.WARNING, logger="neuralguard.producer"):
+        KafkaRecordSink(producer, "t").close(timeout=0)
+    assert producer.calls == [("close", 0)]
+    assert "records not delivered" in caplog.text
 
 
 def test_kafka_sink_needs_a_topic():
@@ -280,6 +282,29 @@ def test_create_kafka_producer_zero_retries_tries_once():
     with pytest.raises(RETRYABLE[0]):
         create_kafka_producer(SETTINGS, retries=0, producer_factory=factory, sleep=sleeps.append)
     assert len(factory.calls) == 1 and sleeps == []
+
+
+def test_create_kafka_producer_gives_up_when_stopped_while_waiting():
+    # docker stop while Kafka is still unreachable: give up at once instead of ignoring
+    # the request for the minute the retries take.
+    stop = threading.Event()
+
+    def factory(**kwargs):
+        stop.set()  # SIGTERM arrives during the first attempt
+        raise RETRYABLE[0]("no brokers")
+
+    sleeps = []
+    producer = create_kafka_producer(
+        SETTINGS, producer_factory=factory, sleep=sleeps.append, stop_event=stop
+    )
+    assert producer is None
+    assert sleeps == []  # waited on the event, which was already set
+
+    calls = []
+    producer = create_kafka_producer(
+        SETTINGS, producer_factory=lambda **kw: calls.append(kw), stop_event=stop
+    )
+    assert producer is None and calls == []  # already stopped: no attempt at all
 
 
 def test_create_kafka_producer_does_not_retry_other_errors():

@@ -98,7 +98,12 @@ def _timestamp(value: Any) -> float:
         return time.time()
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise InvalidRecordError(f"timestamp must be epoch seconds, got {value!r}")
-    value = float(value)
+    try:
+        value = float(value)
+    except OverflowError:  # JSON integers can have thousands of digits; never echo them
+        raise InvalidRecordError(
+            "timestamp is not a plausible capture time (an integer too large for a float)"
+        ) from None
     if not math.isfinite(value) or value < 0:
         raise InvalidRecordError(f"timestamp must be a finite, non-negative number, got {value}")
     if value > MAX_TIMESTAMP:
@@ -117,9 +122,17 @@ def _ip(value: Any, name: str) -> str | None:
     if value.strip().lower() in _UNKNOWN_IPS:
         return None
     try:
-        return str(ipaddress.ip_address(value.strip()))
+        address = ipaddress.ip_address(value.strip())
     except ValueError:
         raise InvalidRecordError(f"{name} is not a valid IP address: {value!r}") from None
+    if getattr(address, "scope_id", None) is not None:
+        # A zone id ("fe80::1%eth0") only means something on the host that wrote it and is
+        # never part of a captured packet, yet it may hold anything: newlines and terminal
+        # escapes (forged log lines) or megabytes of text (memory pinned in every window).
+        raise InvalidRecordError(
+            f"{name} must not have an IPv6 zone id (after '%'): {value[:60]!r}"
+        )
+    return str(address)
 
 
 def _protocol(value: Any) -> str:

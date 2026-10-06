@@ -26,10 +26,11 @@ from __future__ import annotations
 
 import math
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from typing import Any
 
+from neuralguard.config import Settings
 from neuralguard.detector import Detection, severity_for
 from neuralguard.features import features_as_dict
 
@@ -107,27 +108,82 @@ class AlertThrottler:
     throttling is deterministic and replaying a capture throttles exactly like live
     traffic. ``cooldown_seconds=0`` disables throttling. At most ``max_keys`` keys are
     remembered: beyond that, keys whose cooldown has expired are forgotten first, then
-    the ones whose last alert is oldest. Not thread-safe.
+    the ones whose last alert is oldest; what a forgotten key still held back is reported
+    by the next :meth:`flush`. Not thread-safe.
+
+    **Corroboration** (``min_hits`` > 1): a key raises its first alert only once it has
+    ``min_hits`` threat detections within ``corroboration_seconds``. Scans and floods are
+    many packets by nature, while a lone misfire of the model is not, so this removes most
+    false alarms. The detections held back meanwhile are folded into that first alert's
+    suppressed count. Those that never reach ``min_hits`` are dropped and counted in
+    :attr:`uncorroborated_total`. A key stays corroborated while its detections keep
+    coming at most ``corroboration_seconds`` apart, so an ongoing attack is never held
+    back again. In total: alerts + :attr:`suppressed_total` + :attr:`uncorroborated_total`
+    + :attr:`pending` = threats.
     """
 
-    def __init__(self, cooldown_seconds: float, max_keys: int = DEFAULT_MAX_KEYS) -> None:
+    def __init__(
+        self,
+        cooldown_seconds: float,
+        max_keys: int = DEFAULT_MAX_KEYS,
+        *,
+        min_hits: int = 1,
+        corroboration_seconds: float = 30.0,
+    ) -> None:
         cooldown = float(cooldown_seconds)
         if not math.isfinite(cooldown) or cooldown < 0:
             raise ValueError(f"cooldown_seconds must be a finite number >= 0, got {cooldown}")
         if max_keys < 1:
             raise ValueError(f"max_keys must be >= 1, got {max_keys}")
+        if isinstance(min_hits, bool) or not isinstance(min_hits, int) or min_hits < 1:
+            raise ValueError(f"min_hits must be an integer >= 1, got {min_hits!r}")
+        corroboration = float(corroboration_seconds)
+        if not math.isfinite(corroboration) or corroboration <= 0:
+            raise ValueError(
+                f"corroboration_seconds must be a finite number > 0, got {corroboration}"
+            )
         self.cooldown_seconds = cooldown
         self.max_keys = int(max_keys)
+        self.min_hits = min_hits
+        self.corroboration_seconds = corroboration
+        # Detection times of keys still waiting for corroboration (least recent first).
+        self._pending: OrderedDict[ThrottleKey, deque[float]] = OrderedDict()
+        # Corroborated keys and the time of their latest detection (least recent first).
+        self._corroborated: OrderedDict[ThrottleKey, float] = OrderedDict()
+        self._uncorroborated_total = 0
         # Ordered by last emission (oldest first), which is what pruning needs.
         self._keys: OrderedDict[ThrottleKey, _KeyState] = OrderedDict()
+        # Summaries of keys forgotten while they held detections back, for the next flush().
+        self._owed: list[tuple[Detection, int]] = []
         self._suppressed_total = 0
         self._latest = float("-inf")
 
+    @classmethod
+    def from_settings(cls, settings: Settings) -> AlertThrottler:
+        """The throttler configured by ``settings`` (cooldown and corroboration)."""
+        return cls(
+            settings.alert_cooldown_seconds,
+            min_hits=settings.alert_min_hits,
+            corroboration_seconds=settings.alert_corroboration_seconds,
+        )
+
     @property
     def suppressed_total(self) -> int:
-        """Threats suppressed since this throttler was created, not counting those that
-        :meth:`flush` later turned into alerts (so alerts + this = threats)."""
+        """Threats represented by an alert without being one (duplicates during a
+        cooldown, and detections held back until their key was corroborated), not
+        counting those that :meth:`flush` later turned into alerts."""
         return self._suppressed_total
+
+    @property
+    def uncorroborated_total(self) -> int:
+        """Threat detections dropped because their key never reached ``min_hits``
+        detections within ``corroboration_seconds``."""
+        return self._uncorroborated_total
+
+    @property
+    def pending(self) -> int:
+        """Threat detections currently held back, waiting for corroboration."""
+        return sum(len(hits) for hits in self._pending.values())
 
     @property
     def tracked_keys(self) -> int:
@@ -137,31 +193,89 @@ class AlertThrottler:
     def check(self, detection: Detection) -> int | None:
         """Decide whether ``detection`` should produce an alert.
 
-        Returns ``None`` to suppress it, otherwise the number of alerts suppressed for
-        its key since the last emitted one (0 for the first). Throttling disabled
-        (cooldown 0) always returns 0. A detection that is not a threat never produces
-        an alert: ``None``, without counting as suppressed.
+        Returns ``None`` to suppress it (or hold it back for corroboration), otherwise
+        the number of other detections the alert stands for: those suppressed for its key
+        since the last emitted alert, plus those held back until it was corroborated (0
+        for a first alert without corroboration). Throttling disabled (cooldown 0) emits
+        every corroborated detection. A detection that is not a threat never produces an
+        alert: ``None``, without counting as suppressed.
         """
         if not detection.is_threat:
             return None
-        if self.cooldown_seconds == 0:
-            return 0
-
         timestamp = float(detection.record["timestamp"])
         self._latest = max(self._latest, timestamp)
         key = throttle_key(detection)
+        held = self._corroborate(key, timestamp)
+        if held is None:
+            return None
+        if self.cooldown_seconds == 0:
+            self._suppressed_total += held
+            return held
+
         state = self._keys.get(key)
         if state is not None and timestamp - state.last_emitted < self.cooldown_seconds:
-            state.suppressed += 1
+            state.suppressed += 1 + held
             state.latest_suppressed = detection
-            self._suppressed_total += 1
+            self._suppressed_total += 1 + held
             return None
 
-        suppressed = state.suppressed if state is not None else 0
+        suppressed = (state.suppressed if state is not None else 0) + held
+        self._suppressed_total += held
         self._keys[key] = _KeyState(timestamp)
         self._keys.move_to_end(key)
         self._prune()
         return suppressed
+
+    def _corroborate(self, key: ThrottleKey, timestamp: float) -> int | None:
+        """``None`` to hold this detection of ``key`` back; otherwise how many detections
+        held back earlier it now stands for (0 when the key was already corroborated)."""
+        if self.min_hits == 1:
+            return 0
+        last = self._corroborated.get(key)
+        if last is not None and timestamp - last <= self.corroboration_seconds:
+            self._corroborated[key] = max(last, timestamp)
+            self._corroborated.move_to_end(key)
+            return 0
+        if last is not None:  # the attack went quiet: corroborate it again
+            del self._corroborated[key]
+
+        hits = self._pending.get(key)
+        if hits is None:
+            hits = self._pending[key] = deque()
+        else:
+            self._pending.move_to_end(key)
+        cutoff = timestamp - self.corroboration_seconds
+        while hits and hits[0] < cutoff:
+            hits.popleft()
+            self._uncorroborated_total += 1
+        hits.append(timestamp)
+        if len(hits) < self.min_hits:
+            while len(self._pending) > self.max_keys:  # bound memory: drop the stalest
+                _, dropped = self._pending.popitem(last=False)
+                self._uncorroborated_total += len(dropped)
+            return None
+
+        del self._pending[key]
+        self._corroborated[key] = timestamp
+        self._corroborated.move_to_end(key)
+        while len(self._corroborated) > self.max_keys:
+            self._corroborated.popitem(last=False)  # it will just be corroborated again
+        return len(hits) - 1
+
+    def _expire_corroboration(self, everything: bool) -> None:
+        """Drop held-back detections too old to be corroborated (all of them with
+        ``everything``) and forget keys whose attack went quiet."""
+        cutoff = self._latest - self.corroboration_seconds
+        for key in list(self._pending):
+            hits = self._pending[key]
+            while hits and (everything or hits[0] < cutoff):
+                hits.popleft()
+                self._uncorroborated_total += 1
+            if not hits:
+                del self._pending[key]
+        corroborated = self._corroborated
+        while corroborated and next(iter(corroborated.values())) < cutoff:
+            corroborated.popitem(last=False)
 
     def flush(
         self, now: float | None = None, *, everything: bool = False
@@ -179,8 +293,10 @@ class AlertThrottler:
         """
         if now is not None:
             self._latest = max(self._latest, float(now))
+        if self.min_hits > 1:
+            self._expire_corroboration(everything)
         expiry = self._latest - self.cooldown_seconds
-        summaries: list[tuple[Detection, int]] = []
+        summaries, self._owed = self._owed, []
         for key in list(self._keys):
             state = self._keys[key]
             if not everything and state.last_emitted > expiry:
@@ -203,12 +319,19 @@ class AlertThrottler:
         # when packets arrive out of order - good enough for a memory bound).
         expiry = self._latest - self.cooldown_seconds
         while len(keys) > 1:
-            state = next(iter(keys.values()))
+            key, state = next(iter(keys.items()))
             if state.last_emitted > expiry:
                 break
-            keys.popitem(last=False)
+            self._forget(key)
         while len(keys) > self.max_keys:
-            keys.popitem(last=False)
+            self._forget(next(iter(keys)))
+
+    def _forget(self, key: ThrottleKey) -> None:
+        """Drop ``key``; a summary of what it still holds back is owed to :meth:`flush`."""
+        state = self._keys.pop(key)
+        if state.latest_suppressed is not None:
+            self._owed.append((state.latest_suppressed, state.suppressed - 1))
+            self._suppressed_total -= 1  # that one is an alert now
 
 
 def _iso_utc(epoch_seconds: float) -> str | None:

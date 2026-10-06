@@ -9,7 +9,10 @@ logs the problem and carries on.
   :data:`INDEX_MAPPINGS`, so IP addresses, dates and scores get proper field types
   (Grafana's panels rely on them). While Elasticsearch is unreachable, documents stay
   buffered (bounded by ``max_buffer``; the oldest are dropped first) and delivery is
-  retried with a growing back-off, so a dead cluster never stalls packet processing.
+  retried with a growing back-off, so a dead cluster does not stall packet processing:
+  each attempt waits at most ``REQUEST_TIMEOUT_SECONDS`` (a host that drops packets
+  instead of refusing them costs that much per attempt), the last one at shutdown
+  ``CLOSE_TIMEOUT_SECONDS``.
 * :class:`ConsoleSink` logs one readable line per alert on the ``neuralguard.alerts``
   logger, e.g.
   ``ALERT [high] port_scan score=0.97 203.0.113.5:40000 -> 192.168.1.20:22 TCP S (+12 suppressed)``.
@@ -22,6 +25,7 @@ import ipaddress
 import itertools
 import json
 import logging
+import re
 import time
 import uuid
 from collections import deque
@@ -32,12 +36,13 @@ from typing import Any, TextIO
 from elasticsearch import ApiError, Elasticsearch, SerializationError, TransportError
 from elasticsearch.helpers import bulk
 
-from neuralguard.config import Settings
+from neuralguard.config import Settings, redact_credentials
 
 logger = logging.getLogger(__name__)
 alert_logger = logging.getLogger("neuralguard.alerts")
 
 REQUEST_TIMEOUT_SECONDS = 10.0
+CLOSE_TIMEOUT_SECONDS = 2.0  # for the last delivery attempt, when the detector stops
 ALREADY_EXISTS_ERROR = "resource_already_exists_exception"
 
 # Statuses of a whole bulk request worth retrying later (overloaded / restarting cluster).
@@ -45,6 +50,8 @@ _RETRYABLE_STATUSES = frozenset({408, 429, 502, 503, 504})
 _MAX_RETRY_DELAY = 60.0
 _LOG_REPEAT_SECONDS = 60.0
 _MAX_LOGGED_ERRORS = 3
+# C0/C1 control characters and the Unicode line/paragraph separators.
+_CONTROL_CHARACTERS = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
 _FIELD_TYPES = {
     "@timestamp": "date",
@@ -151,6 +158,7 @@ class ElasticsearchSink:
         self._failures = 0  # consecutive failed delivery attempts
         self._last_failure_log: float | None = None
         self._last_drop_log: float | None = None
+        self._closing = False
         self._closed = False
 
     @classmethod
@@ -186,7 +194,7 @@ class ElasticsearchSink:
         Returns ``True`` when the index exists afterwards. Errors are logged, not raised.
         """
         try:
-            client = self.client
+            client = self._api()
             if not client.indices.exists(index=self.index):
                 client.indices.create(index=self.index, mappings=INDEX_MAPPINGS)
                 logger.info("created Elasticsearch index %r", self.index)
@@ -258,9 +266,11 @@ class ElasticsearchSink:
             self.flush()
 
     def close(self) -> None:
-        """Flush what is buffered, then close the client. Safe to call twice."""
+        """Flush what is buffered - one attempt, waiting at most ``CLOSE_TIMEOUT_SECONDS``
+        per request - then close the client. Safe to call twice."""
         if self._closed:
             return
+        self._closing = True  # the requests of this last attempt time out sooner
         self.flush()
         self._closed = True
         if self._buffer:
@@ -272,16 +282,25 @@ class ElasticsearchSink:
             try:
                 self._client.close()
             except Exception as exc:  # closing is best effort
-                logger.debug("error closing Elasticsearch client: %s", exc)
+                logger.debug("error closing Elasticsearch client: %s", redact_credentials(str(exc)))
 
     # -- internals -------------------------------------------------------------------
+
+    def _api(self) -> Any:
+        """The client for the next request; while closing, one that gives up after
+        ``CLOSE_TIMEOUT_SECONDS`` (elasticsearch 8 per-request options)."""
+        client = self.client
+        options = getattr(client, "options", None)
+        if self._closing and callable(options):
+            return options(request_timeout=CLOSE_TIMEOUT_SECONDS)
+        return client
 
     def _send(self, batch: list[tuple[str, dict[str, Any]]]) -> bool:
         """Bulk-index one batch. ``False`` means "keep it buffered and retry later"."""
         actions = ({"_index": self.index, "_id": doc_id, "_source": doc} for doc_id, doc in batch)
         try:
             success, errors = bulk(
-                self.client, actions, chunk_size=len(batch), raise_on_error=False
+                self._api(), actions, chunk_size=len(batch), raise_on_error=False
             )
         except SerializationError as exc:  # a bad document would fail forever: drop it
             self._reject(batch, f"cannot serialise alert documents: {exc}")
@@ -320,7 +339,7 @@ class ElasticsearchSink:
 
     def _reject(self, batch: list[tuple[str, dict[str, Any]]], reason: str) -> None:
         self.failed += len(batch)
-        logger.error("%s; %d alerts discarded", reason, len(batch))
+        logger.error("%s; %d alerts discarded", redact_credentials(reason), len(batch))
 
     def _enforce_max_buffer(self) -> None:
         overflow = len(self._buffer) - self.max_buffer
@@ -341,6 +360,9 @@ class ElasticsearchSink:
 
     def _failed_attempt(self) -> None:
         self._failures += 1
+        # The back-off counts from the end of the attempt: one that timed out can take
+        # longer than the first delays.
+        self._last_flush = self._clock()
 
     def _retry_delay(self) -> float:
         if not self._failures:
@@ -353,7 +375,13 @@ class ElasticsearchSink:
 
     def _log_failure(self, message: str, *args: Any) -> None:
         """Log a delivery failure: at ERROR the first time, then at most once a minute
-        while the outage lasts (DEBUG in between) - an outage must not flood the logs."""
+        while the outage lasts (DEBUG in between) - an outage must not flood the logs.
+
+        Error texts can quote a host URL, so credentials in one are masked."""
+        args = tuple(
+            redact_credentials(str(arg)) if isinstance(arg, (str, BaseException)) else arg
+            for arg in args
+        )
         now = self._clock()
         last = self._last_failure_log
         if last is None or now - last >= _LOG_REPEAT_SECONDS:
@@ -413,7 +441,9 @@ def format_alert_line(doc: dict[str, Any]) -> str:
     suppressed = int(doc.get("suppressed_count") or 0)
     if suppressed:
         parts.append(f"(+{suppressed} suppressed)")
-    return " ".join(parts)
+    # The fields come from untrusted traffic: never let one break the line or send
+    # terminal escape sequences to the console.
+    return _CONTROL_CHARACTERS.sub(_escape, " ".join(parts))
 
 
 class JsonlSink:
@@ -469,6 +499,10 @@ class JsonlSink:
         except OSError as exc:
             logger.error("cannot close %s: %s", self.path, exc)
         self._file = None
+
+
+def _escape(match: re.Match[str]) -> str:
+    return match.group().encode("unicode_escape").decode("ascii")
 
 
 def _endpoint(ip: Any, port: Any) -> str:

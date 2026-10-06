@@ -191,6 +191,11 @@ def test_load_jsonl_bad_json_names_the_line(tmp_path):
         (json.dumps({**rec(2.0), "timestamp": None}), r"line 2: record has no timestamp"),
         (json.dumps({k: v for k, v in rec(2.0).items() if k != "label"}), r"line 2: .*no label"),
         (json.dumps(rec(2.0, ttl=999)), r"line 2: ttl"),
+        pytest.param(
+            '{"timestamp": 1' + "0" * 400 + ', "label": "normal"}',
+            r"line 2: timestamp",
+            id="huge-integer-timestamp",
+        ),
     ],
 )
 def test_load_jsonl_rejects_bad_records(tmp_path, line, message):
@@ -281,8 +286,8 @@ def test_train_model_stores_params_and_metrics_in_metadata(file_result, data_fil
     assert training["test_size"] == 0.25
     assert (training["train_records"], training["test_records"]) == (300, 100)
     assert set(metadata["metrics"]) == set(METRIC_SUMMARY_KEYS)
-    for key in METRIC_SUMMARY_KEYS:
-        assert metadata["metrics"][key] == file_result.metrics[key]
+    for key in METRIC_SUMMARY_KEYS:  # no episodes or attack-free stream in a JSONL file
+        assert metadata["metrics"][key] == file_result.metrics.get(key)
     json.dumps(metadata)
     # and it survives a save/load round trip
     reloaded = ThreatModel.load(file_result.model.save(tmp_path / "m.joblib"))
@@ -333,47 +338,85 @@ def test_train_model_validates_parameters(data_file, kwargs, message):
 # --------------------------------------------------------------------------- simulated data
 
 
-def fake_simulated_dataset(calls):
-    """Stand-in for simulated_dataset: synthetic separable arrays, records the calls.
+def fake_simulation(n_samples, seed):
+    """Synthetic separable arrays standing in for a simulated stream.
 
     The classes are separated in *every* column, so each split of each tree separates
     them and even a 4-tree forest is exactly right (with one informative column out of
-    21, a few trees fit the noise and accuracy drops just below 1.0).
+    22, a few trees fit the noise and accuracy drops just below 1.0). Every third record
+    is a syn_flood packet, all of one episode.
     """
-
-    def fake(n_samples, *, seed, attack_ratio, window_seconds, start_time=1_700_000_000.0):
-        calls.append(
-            {"n": n_samples, "seed": seed, "ratio": attack_ratio, "window": window_seconds}
-        )
-        rng = np.random.default_rng(seed)
-        y = ["normal" if i % 3 else "syn_flood" for i in range(n_samples)]
-        X = rng.normal(0, 0.3, size=(n_samples, N_FEATURES))
-        X += np.array([[5.0] if label == "syn_flood" else [0.0] for label in y])
-        return X, y
-
-    return fake
+    rng = np.random.default_rng(seed)
+    y = ["normal" if i % 3 else "syn_flood" for i in range(n_samples)]
+    X = rng.normal(0, 0.3, size=(n_samples, N_FEATURES))
+    X += np.array([[5.0] if label == "syn_flood" else [0.0] for label in y])
+    return X, y
 
 
-@pytest.mark.parametrize(("n_samples", "test_n"), [(800, 800), (4000, 1000), (8000, 2000)])
-def test_simulated_training_evaluates_on_a_separate_seed(monkeypatch, n_samples, test_n):
-    calls = []
-    monkeypatch.setattr(train, "simulated_dataset", fake_simulated_dataset(calls))
+@pytest.fixture
+def fake_simulator_data(monkeypatch):
+    """Fakes for the simulated training and test streams; records the requests."""
+    calls = {"train": [], "test": []}
+
+    def dataset(n_samples, *, seed, attack_ratio, window_seconds, skip_episode_starts=0):
+        calls["train"].append((n_samples, seed, attack_ratio, window_seconds, skip_episode_starts))
+        return fake_simulation(n_samples, seed)
+
+    def stream(n_samples, *, seed, attack_ratio, window_seconds):
+        calls["test"].append((n_samples, seed, attack_ratio, window_seconds))
+        X, y = fake_simulation(n_samples, seed)
+        attack = np.array([label != "normal" for label in y])
+        positions = np.where(attack, np.cumsum(attack) - 1, -1)
+        return train._SimulatedStream(seed, X, y, attack.astype(np.int64), positions)
+
+    def false_alerts(model, *, threshold, seed, records):
+        calls["attack_free"] = seed
+        return {"false_alerts": 3, "attack_free_minutes": 6.0, "false_alerts_per_hour": 30.0}
+
+    monkeypatch.setattr(train, "simulated_dataset", dataset)
+    monkeypatch.setattr(train, "_simulated_stream", stream)
+    monkeypatch.setattr(train, "_false_alerts", false_alerts)
+    return calls
+
+
+@pytest.mark.parametrize(
+    ("n_samples", "training", "test"),
+    [
+        (800, [(800, 5)], [(800, 6)]),
+        (4000, [(4000, 5)], [(1000, 6)]),
+        (8000, [(8000, 5)], [(2000, 6)]),
+        # Beyond 60k records: independent streams (seed + 100 i), one held-out each.
+        (150_000, [(50_000, 5), (50_000, 105), (50_000, 205)], [(12_500, s) for s in (6, 7, 8)]),
+    ],
+)
+def test_simulated_training_evaluates_on_separate_seeds(
+    fake_simulator_data, n_samples, training, test
+):
     result = train_model(
         n_samples=n_samples, seed=5, attack_ratio=0.4, window_seconds=4.0, n_estimators=4
     )
-    assert calls == [
-        {"n": n_samples, "seed": 5, "ratio": 0.4, "window": 4.0},
-        {"n": test_n, "seed": 6, "ratio": 0.4, "window": 4.0},
-    ]
+    calls = fake_simulator_data
+    warmup = train.EPISODE_WARMUP_PACKETS
+    assert calls["train"] == [(n, seed, 0.4, 4.0, warmup) for n, seed in training]
+    assert calls["test"] == [(n, seed, 0.4, 4.0) for n, seed in test]
+    assert calls["attack_free"] == test[0][1]  # attack-free traffic of a held-out network
     assert result.simulated is True
-    assert (result.train_size, result.test_size) == (n_samples, test_n)
+    assert (result.train_size, result.test_size) == (n_samples, sum(n for n, _ in test))
     assert result.model.window_seconds == 4.0
-    training = result.model.metadata["training"]
-    assert training["source"] == "simulated"
-    assert (training["seed"], training["test_seed"]) == (5, 6)
-    assert training["attack_ratio"] == 0.4
-    assert training["n_samples"] == n_samples
+    params = result.model.metadata["training"]
+    assert params["source"] == "simulated"
+    assert params["seed"] == 5
+    assert params["seeds"] == [seed for _, seed in training]
+    assert params["test_seeds"] == [seed for _, seed in test]
+    assert not set(params["seeds"]) & set(params["test_seeds"])
+    assert params["attack_ratio"] == 0.4
+    assert params["n_samples"] == n_samples
     assert result.metrics["accuracy"] == 1.0
+    assert [row["seed"] for row in result.metrics["test_streams"]] == params["test_seeds"]
+    found = {"episodes": len(test), "detected": len(test)}  # one fake episode per stream
+    assert result.metrics["episodes"] == {"syn_flood": found}
+    assert result.metrics["episode_detection_rate"] == 1.0
+    assert result.metrics["false_alerts_per_hour"] == 30.0
 
 
 def test_simulated_dataset_drives_the_simulator(monkeypatch):
@@ -384,10 +427,10 @@ def test_simulated_dataset_drives_the_simulator(monkeypatch):
             self.args = {"seed": seed, "attack_ratio": attack_ratio, "start_time": start_time}
             created.append(self)
 
-        def records(self, count=None):
+        def records_with_episodes(self, count=None):
             self.count = count
             stream = labelled_stream(count, seed=self.args["seed"], start=self.args["start_time"])
-            return iter(stream)
+            return ((record, 0, -1) for record in stream)
 
     monkeypatch.setattr(train, "TrafficSimulator", FakeSimulator)
     X, y = simulated_dataset(120, seed=3, attack_ratio=0.25, window_seconds=5.0)
@@ -408,6 +451,26 @@ def test_simulated_dataset_rejects_empty_request():
         simulated_dataset(0, seed=1, attack_ratio=0.2, window_seconds=10.0)
 
 
+def test_simulated_dataset_can_leave_out_the_first_packets_of_each_episode():
+    # They look like ordinary traffic (a flood's first SYN is a new visitor's): labelled
+    # as attacks, they taught the model to alert on ordinary first contacts.
+    from neuralguard.simulator import TrafficSimulator
+
+    kwargs = {"seed": 11, "attack_ratio": 0.3, "window_seconds": 10.0}
+    full_X, full_y = simulated_dataset(3000, **kwargs)
+    X, y = simulated_dataset(3000, **kwargs, skip_episode_starts=10)
+    simulator = TrafficSimulator(seed=11, attack_ratio=0.3, start_time=train.DEFAULT_START_TIME)
+    items = list(simulator.records_with_episodes(3000))
+    keep = np.array([position < 0 or position >= 10 for _, _, position in items])
+    episodes = {episode for _, episode, _ in items if episode}
+    assert len(episodes) >= 2
+    assert (~keep).sum() == sum(min(10, sum(e == ep for _, e, _ in items)) for ep in episodes)
+    assert {full_y[i] for i in np.flatnonzero(~keep)} <= set(LABELS) - {"normal"}
+    # Left out of the result only: they still count in the windows of later packets.
+    np.testing.assert_array_equal(X, full_X[keep])
+    assert y == [label for label, kept in zip(full_y, keep, strict=True) if kept]
+
+
 def test_simulated_training_end_to_end():
     """Uses the real TrafficSimulator (small sizes, so it stays fast)."""
     X, y = simulated_dataset(500, seed=11, attack_ratio=0.3, window_seconds=10.0)
@@ -418,8 +481,9 @@ def test_simulated_training_end_to_end():
 
     result = train_model(n_samples=3000, seed=11, attack_ratio=0.3, n_estimators=10)
     assert result.simulated is True
-    assert (result.train_size, result.test_size) == (3000, 1000)
-    assert sum(result.class_counts.values()) == 3000
+    assert 2900 < result.train_size < 3000  # without the first packets of each episode
+    assert result.test_size == 1000
+    assert sum(result.class_counts.values()) == result.train_size
     assert "normal" in result.class_counts
     assert len(result.class_counts) >= 2
     assert 0.0 <= result.metrics["accuracy"] <= 1.0

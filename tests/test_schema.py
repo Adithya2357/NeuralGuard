@@ -44,6 +44,41 @@ def test_ipv6_is_accepted_and_compressed():
     assert record["source_ip"] == "2001:db8::1"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "fe80::1%eth0",
+        "fe80::bad%\n2026-10-06 12:00:00,000 INFO    neuralguard.consumer: stats\x1b]0;x\x07",
+        "fe80::1%" + "A" * 100_000,
+    ],
+    ids=["interface", "log-injection", "100-kB"],
+)
+def test_ipv6_zone_ids_are_rejected(value):
+    # No captured packet carries one, but a zone id may contain anything: forged log
+    # lines, terminal escapes, or megabytes that every window would keep as a host key.
+    for field in ("source_ip", "destination_ip"):
+        with pytest.raises(InvalidRecordError, match="zone id") as excinfo:
+            normalize_record({field: value})
+        assert len(str(excinfo.value)) < 200
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "10.0.0.1",
+        " 192.168.1.10 ",
+        "2001:0db8:0000:0000:0000:0000:0000:0001",
+        "FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF",
+        "::ffff:255.255.255.255",
+        "fe80::1",
+    ],
+)
+def test_accepted_ip_addresses_are_short_and_canonical(value):
+    canonical = normalize_record({"source_ip": value})["source_ip"]
+    assert len(canonical) <= 45 and "%" not in canonical
+    assert canonical == canonical.strip().lower()
+
+
 def test_unknown_protocol_maps_to_other_and_drops_flags():
     record = normalize_record({"protocol": "Ether / IP / TCP", "tcp_flags": "S"})
     assert record["protocol"] == "OTHER"
@@ -86,6 +121,16 @@ def test_implausible_timestamps_are_rejected(timestamp):
     # feature extractor's forward-only clock far into the future for good.
     with pytest.raises(InvalidRecordError, match="not a plausible capture time"):
         normalize_record({"timestamp": timestamp})
+
+
+@pytest.mark.parametrize(
+    "timestamp", [10**400, -(10**400), 10**309], ids=["1e400", "-1e400", "1e309"]
+)
+def test_integers_too_large_for_a_float_are_invalid_records(timestamp):
+    # json.loads turns a 400-digit number into a Python int; float() of it overflows.
+    with pytest.raises(InvalidRecordError, match="not a plausible capture time") as excinfo:
+        normalize_record({"timestamp": timestamp})
+    assert "0000000000" not in str(excinfo.value)  # the huge value is not echoed
 
 
 def test_millisecond_timestamps_get_a_hint():

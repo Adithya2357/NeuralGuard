@@ -293,11 +293,12 @@ def test_flush_everything_at_shutdown_and_forget_quiet_keys():
     assert throttler.tracked_keys == 0  # expired, nothing held back: nothing to remember
 
 
-def test_flush_accounts_for_every_threat_exactly_once():
+@pytest.mark.parametrize("max_keys", [alerts.DEFAULT_MAX_KEYS, 3])
+def test_flush_accounts_for_every_threat_exactly_once(max_keys):
     import random
 
     rng = random.Random(3)
-    throttler = AlertThrottler(cooldown_seconds=5.0)
+    throttler = AlertThrottler(cooldown_seconds=5.0, max_keys=max_keys)
     threats = accounted = alerts = 0
     ts = 0.0
     for _ in range(3000):
@@ -349,6 +350,23 @@ def test_max_keys_drops_oldest_when_none_expired():
     assert throttler.tracked_keys == 3
 
 
+def test_a_forgotten_key_still_reports_what_it_held_back():
+    # More than max_keys targets within one cooldown (a sweep during a flood) used to drop
+    # the flood's held-back detections from every alert document.
+    throttler = AlertThrottler(cooldown_seconds=5.0, max_keys=2)
+    suppressed_counts = [throttler.check(detection(ts=0.0, dst="10.0.0.1"))]
+    tail = [detection(ts=0.1 * i, dst="10.0.0.1") for i in (1, 2, 3)]
+    assert all(throttler.check(d) is None for d in tail)
+    for dst in ("10.0.0.2", "10.0.0.3"):  # 10.0.0.1, the oldest, is forgotten
+        suppressed_counts.append(throttler.check(detection(ts=0.5, dst=dst)))
+    assert suppressed_counts == [0, 0, 0] and throttler.tracked_keys == 2
+    summaries = throttler.flush(everything=True)
+    assert summaries == [(tail[-1], 2)]
+    suppressed_counts += [n for _, n in summaries]
+    assert sum(1 + n for n in suppressed_counts) == 6  # every threat, exactly once
+    assert len(suppressed_counts) + throttler.suppressed_total == 6
+
+
 def test_max_keys_drops_expired_keys_first():
     throttler = AlertThrottler(cooldown_seconds=5.0, max_keys=3)
     assert throttler.check(detection(ts=0.0, dst="10.0.0.1")) == 0
@@ -388,3 +406,146 @@ def test_throttle_key():
 def test_iso_utc_whole_second_has_milliseconds():
     expected = datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
     assert alerts._iso_utc(expected.timestamp()) == "2024-01-02T03:04:05.000Z"
+
+
+# --------------------------------------------------------------------------- corroboration
+
+
+def test_lone_detections_are_held_back_until_corroborated():
+    throttler = AlertThrottler(cooldown_seconds=5.0, min_hits=3, corroboration_seconds=30.0)
+    assert throttler.check(detection(ts=0.0)) is None
+    assert throttler.check(detection(ts=1.0)) is None
+    assert throttler.pending == 2
+    assert throttler.check(detection(ts=2.0)) == 2  # the alert stands for the two held back
+    assert throttler.pending == 0
+    assert throttler.check(detection(ts=3.0)) is None  # cooldown, as usual
+    assert throttler.suppressed_total == 3
+    assert throttler.uncorroborated_total == 0
+
+
+def test_a_lone_misfire_never_becomes_an_alert():
+    throttler = AlertThrottler(cooldown_seconds=5.0, min_hits=3, corroboration_seconds=30.0)
+    assert throttler.check(detection(ts=0.0)) is None
+    assert throttler.flush(now=10.0) == []
+    assert throttler.pending == 1  # may still be corroborated
+    assert throttler.flush(now=31.0) == []
+    assert (throttler.pending, throttler.uncorroborated_total) == (0, 1)
+
+
+def test_detections_must_fall_within_the_corroboration_window():
+    throttler = AlertThrottler(cooldown_seconds=5.0, min_hits=3, corroboration_seconds=10.0)
+    for ts in (0.0, 20.0, 40.0):
+        assert throttler.check(detection(ts=ts)) is None
+    assert (throttler.pending, throttler.uncorroborated_total) == (1, 2)
+
+
+def test_an_ongoing_attack_is_not_held_back_again():
+    throttler = AlertThrottler(cooldown_seconds=5.0, min_hits=3, corroboration_seconds=30.0)
+    for ts in (0.0, 1.0):
+        throttler.check(detection(ts=ts))
+    assert throttler.check(detection(ts=2.0)) == 2
+    assert throttler.check(detection(ts=10.0)) == 0  # cooldown over: alerts straight away
+
+
+def test_an_attack_that_went_quiet_is_corroborated_again():
+    throttler = AlertThrottler(cooldown_seconds=5.0, min_hits=3, corroboration_seconds=30.0)
+    for ts in (0.0, 1.0):
+        throttler.check(detection(ts=ts))
+    assert throttler.check(detection(ts=2.0)) == 2
+    assert throttler.check(detection(ts=100.0)) is None
+    assert throttler.pending == 1
+
+
+def test_corroboration_is_per_attack_type_and_target():
+    throttler = AlertThrottler(cooldown_seconds=5.0, min_hits=2, corroboration_seconds=30.0)
+    assert throttler.check(detection(ts=0.0, dst="10.0.0.1")) is None
+    assert throttler.check(detection(ts=0.1, dst="10.0.0.2")) is None
+    assert throttler.check(detection(ts=0.2, dst="10.0.0.1", attack_type="syn_flood")) is None
+    assert throttler.check(detection(ts=0.3, dst="10.0.0.1")) == 1
+    assert throttler.pending == 2
+
+
+def test_corroboration_with_throttling_disabled():
+    throttler = AlertThrottler(cooldown_seconds=0, min_hits=3, corroboration_seconds=30.0)
+    assert throttler.check(detection(ts=0.0)) is None
+    assert throttler.check(detection(ts=1.0)) is None
+    assert throttler.check(detection(ts=2.0)) == 2
+    assert throttler.check(detection(ts=3.0)) == 0  # corroborated: every detection alerts
+
+
+def test_flushing_everything_drops_what_was_never_corroborated():
+    throttler = AlertThrottler(cooldown_seconds=5.0, min_hits=3, corroboration_seconds=30.0)
+    throttler.check(detection(ts=0.0))
+    throttler.check(detection(ts=1.0))
+    assert throttler.flush(everything=True) == []
+    assert (throttler.pending, throttler.uncorroborated_total) == (0, 2)
+
+
+def test_held_back_detections_are_bounded():
+    throttler = AlertThrottler(cooldown_seconds=5.0, max_keys=3, min_hits=2)
+    for i in range(10):
+        assert throttler.check(detection(ts=float(i), dst=f"10.0.0.{i}")) is None
+    assert throttler.pending == 3
+    assert throttler.uncorroborated_total == 7
+
+
+@pytest.mark.parametrize("min_hits", [2, 3, 5])
+def test_corroboration_accounts_for_every_threat_exactly_once(min_hits):
+    import random
+
+    rng = random.Random(min_hits)
+    throttler = AlertThrottler(
+        cooldown_seconds=5.0, max_keys=8, min_hits=min_hits, corroboration_seconds=4.0
+    )
+    threats = accounted = alerts = 0
+    ts = 0.0
+    for _ in range(3000):
+        ts += rng.expovariate(rng.choice((0.2, 3.0, 40.0)))  # lone misfires and floods
+        det = detection(ts=ts, dst=f"10.0.0.{rng.randint(1, 12)}", attack_type="syn_flood")
+        threats += 1
+        results = [throttler.check(det)]
+        if rng.random() < 0.05:
+            results += [n for _, n in throttler.flush(now=ts)]
+        for result in results:
+            if result is not None:
+                alerts += 1
+                accounted += 1 + result
+    for _, n in throttler.flush(everything=True):
+        alerts += 1
+        accounted += 1 + n
+    assert throttler.pending == 0
+    assert accounted == alerts + throttler.suppressed_total
+    assert accounted + throttler.uncorroborated_total == threats
+    assert throttler.uncorroborated_total > 0 and alerts > 0
+
+
+def test_throttler_from_settings():
+    from neuralguard.config import Settings
+
+    throttler = AlertThrottler.from_settings(
+        Settings(alert_cooldown_seconds=2.0, alert_min_hits=5, alert_corroboration_seconds=12.0)
+    )
+    assert (throttler.cooldown_seconds, throttler.min_hits, throttler.corroboration_seconds) == (
+        2.0,
+        5,
+        12.0,
+    )
+    default = AlertThrottler.from_settings(Settings())
+    assert (default.min_hits, default.corroboration_seconds) == (3, 30.0)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"min_hits": 0},
+        {"min_hits": True},
+        {"min_hits": 1.5},
+        {"corroboration_seconds": 0},
+        {"corroboration_seconds": -1},
+        {"corroboration_seconds": math.inf},
+        {"corroboration_seconds": math.nan},
+    ],
+)
+def test_invalid_corroboration_settings(kwargs):
+    with pytest.raises(ValueError):
+        AlertThrottler(5.0, **kwargs)

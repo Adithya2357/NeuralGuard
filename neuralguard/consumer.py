@@ -10,7 +10,7 @@ loop, so one malformed message is skipped and counted instead of killing the con
 to the :class:`~neuralguard.alerts.AlertThrottler`, and every alert that gets through is
 built with :func:`~neuralguard.alerts.build_alert_document` and handed to *every* sink. A
 failing sink is logged and the others (and the loop) carry on. A stats line is logged
-periodically, and on shutdown every sink is flushed and closed before the consumer.
+periodically, and on shutdown every sink is closed (which flushes it) before the consumer.
 
 :func:`install_signal_handlers` turns SIGINT / SIGTERM into a graceful stop
 (``docker stop`` and Ctrl+C).
@@ -27,7 +27,11 @@ from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from neuralguard.config import Settings
-from neuralguard.kafkautil import bootstrap_timeout_options, retryable_kafka_errors
+from neuralguard.kafkautil import (
+    bootstrap_timeout_options,
+    retryable_kafka_errors,
+    wait_before_retry,
+)
 
 if TYPE_CHECKING:
     # Imported lazily at runtime: they pull in scikit-learn, and this module is also
@@ -47,6 +51,7 @@ def create_kafka_consumer(
     backoff_seconds: float = 2.0,
     consumer_factory: Callable[..., Any] | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    stop_event: threading.Event | None = None,
 ) -> Any:
     """A ``kafka.KafkaConsumer`` subscribed to ``settings.kafka_topic``.
 
@@ -56,7 +61,9 @@ def create_kafka_consumer(
 
     While no broker is reachable the connection is retried ``retries`` more times,
     ``backoff_seconds`` apart (each attempt is logged, and with kafka-python 3.x waits at
-    most ``kafkautil.BOOTSTRAP_TIMEOUT_MS``); the last error is re-raised.
+    most ``kafkautil.BOOTSTRAP_TIMEOUT_MS``); the last error is re-raised. Once
+    ``stop_event`` is set (before an attempt or while waiting for the next one) it gives
+    up and returns ``None``; it then waits on the event, not with ``sleep``.
     ``consumer_factory`` (default ``kafka.KafkaConsumer``) and ``sleep`` are injectable
     for tests.
     """
@@ -73,6 +80,9 @@ def create_kafka_consumer(
     servers = ",".join(settings.kafka_bootstrap_servers)
     attempt = 1
     while True:
+        if stop_event is not None and stop_event.is_set():
+            logger.info("stopped before connecting to Kafka at %s", servers)
+            return None
         try:
             consumer = consumer_factory(
                 settings.kafka_topic,
@@ -97,7 +107,9 @@ def create_kafka_consumer(
                 exc,
                 backoff_seconds,
             )
-            sleep(backoff_seconds)
+            if not wait_before_retry(backoff_seconds, stop_event, sleep):
+                logger.info("stopped while waiting for Kafka at %s", servers)
+                return None
             attempt += 1
     logger.info(
         "consuming topic %r from %s as group %r",
@@ -168,9 +180,10 @@ def install_signal_handlers(stop_event: threading.Event) -> None:
 class DetectionService:
     """Runs raw Kafka message values through the detector and fans alerts out to sinks.
 
-    ``sinks`` implement ``emit(doc)``, ``flush()``, ``flush_if_due()`` and ``close()``
-    (see :mod:`neuralguard.sinks`). ``model_version`` is stamped on every alert.
-    ``clock`` (monotonic seconds) only drives the periodic stats line. Counters:
+    ``sinks`` implement ``emit(doc)``, ``flush()``, ``flush_if_due()`` and ``close()``,
+    which delivers what is still buffered (see :mod:`neuralguard.sinks`).
+    ``model_version`` is stamped on every alert. ``clock`` (monotonic seconds) only
+    drives the periodic stats line. Counters:
     ``alerts_emitted``, ``messages_consumed`` (raw values handled, decodable or not)
     and ``sink_errors`` (sink calls that raised). Not thread-safe.
     """
@@ -279,7 +292,7 @@ class DetectionService:
 
         ``tick()`` runs after every poll. However the loop ends - including by an
         exception - the alerts throttling still holds back are sent, every sink is
-        flushed and closed and then the consumer is closed. Returns the detector's stats.
+        closed and then the consumer is closed. Returns the detector's stats.
         """
         if max_messages is not None and max_messages < 0:
             raise ValueError(f"max_messages must be >= 0, got {max_messages}")
@@ -332,7 +345,9 @@ class DetectionService:
         except Exception:  # never skip closing the sinks and the consumer
             logger.exception("error while sending the held-back alerts")
         for sink in self.sinks:
-            self._guarded(sink, "flush")
+            # close() alone: it flushes too, and a separate flush() first would make a
+            # sink whose backend hangs try (and time out) twice before the consumer is
+            # closed - longer than docker stop waits.
             self._guarded(sink, "close")
         try:
             consumer.close()
@@ -350,13 +365,16 @@ class DetectionService:
             messages = self.messages_consumed - self._last_stats_messages
         rate = messages / elapsed if elapsed > 0 else 0.0
         suppressed = int(getattr(self.throttler, "suppressed_total", 0))
+        uncorroborated = int(getattr(self.throttler, "uncorroborated_total", 0))
         logger.info(
-            "%s: processed=%d threats=%d alerts=%d suppressed=%d invalid=%d rate=%.1f msg/s",
+            "%s: processed=%d threats=%d alerts=%d suppressed=%d uncorroborated=%d "
+            "invalid=%d rate=%.1f msg/s",
             "final stats" if final else "stats",
             stats.processed,
             stats.threats,
             self.alerts_emitted,
             suppressed,
+            uncorroborated,
             stats.invalid,
             rate,
             extra={
@@ -364,6 +382,7 @@ class DetectionService:
                 "threats": stats.threats,
                 "alerts_emitted": self.alerts_emitted,
                 "suppressed": suppressed,
+                "uncorroborated": uncorroborated,
                 "invalid": stats.invalid,
                 "msgs_per_sec": round(rate, 1),
             },

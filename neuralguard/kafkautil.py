@@ -6,7 +6,8 @@ cheap for commands that never talk to Kafka.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import threading
+from collections.abc import Callable, Mapping
 from typing import Any
 
 # How long one connection attempt waits for the first cluster metadata. kafka-python 3.x
@@ -52,3 +53,15 @@ def bootstrap_timeout_options(
 ) -> dict[str, int]:
     """``{"bootstrap_timeout_ms": timeout_ms}`` if ``client_class`` supports that setting."""
     return supported_options(client_class, {"bootstrap_timeout_ms": int(timeout_ms)})
+
+
+def wait_before_retry(
+    seconds: float, stop_event: threading.Event | None, sleep: Callable[[float], None]
+) -> bool:
+    """Wait ``seconds`` before the next connection attempt; ``False`` (give up) when
+    ``stop_event`` is set, also during the wait, so a stop request is not ignored for the
+    minute or so that the connection retries can take."""
+    if stop_event is None:
+        sleep(seconds)
+        return True
+    return not stop_event.wait(seconds)

@@ -30,6 +30,7 @@ from neuralguard.kafkautil import (
     BOOTSTRAP_TIMEOUT_MS,
     retryable_kafka_errors,
     supported_options,
+    wait_before_retry,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,15 +89,21 @@ class KafkaRecordSink:
         """Block until every record sent so far was delivered (or failed)."""
         self.producer.flush()
 
-    def close(self) -> None:
-        """Flush, then close the producer. Calling it again does nothing."""
+    def close(self, timeout: float | None = None) -> None:
+        """Close the producer once it has delivered what is still buffered, waiting at
+        most ``timeout`` seconds (``None``: as long as it takes); records still undelivered
+        then are dropped, with a warning. Calling it again does nothing."""
         if self._closed:
             return
         self._closed = True
+        from kafka.errors import KafkaTimeoutError
+
         try:
-            self.producer.flush()
-        finally:
-            self.producer.close()
+            # kafka-python's close() flushes first: no separate flush(), which could wait
+            # once more for an unreachable broker.
+            self.producer.close(timeout=timeout)
+        except KafkaTimeoutError as exc:
+            logger.warning("closed the Kafka producer with records not delivered: %s", exc)
 
 
 class JsonlRecordSink:
@@ -145,6 +152,7 @@ def create_kafka_producer(
     backoff_seconds: float = 2.0,
     producer_factory: Callable[..., Any] | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    stop_event: threading.Event | None = None,
 ) -> Any:
     """A ``kafka.KafkaProducer`` for ``settings.kafka_bootstrap_servers``.
 
@@ -155,9 +163,10 @@ def create_kafka_producer(
     the connection is retried ``retries`` more times, ``backoff_seconds`` apart (each
     attempt is logged, and with kafka-python 3.x waits at most
     ``kafkautil.BOOTSTRAP_TIMEOUT_MS``); the last error is re-raised. Other errors are
-    raised at once.
-    ``producer_factory`` (default ``kafka.KafkaProducer``) and ``sleep`` are injectable
-    for tests.
+    raised at once. Once ``stop_event`` is set (before an attempt or while waiting for
+    the next one) it gives up and returns ``None``; it then waits on the event, not with
+    ``sleep``. ``producer_factory`` (default ``kafka.KafkaProducer``) and ``sleep`` are
+    injectable for tests.
     """
     if retries < 0:
         raise ValueError(f"retries must be >= 0, got {retries}")
@@ -177,6 +186,9 @@ def create_kafka_producer(
     servers = ",".join(settings.kafka_bootstrap_servers)
     attempt = 1
     while True:
+        if _stopped(stop_event):
+            logger.info("stopped before connecting to Kafka at %s", servers)
+            return None
         try:
             producer = producer_factory(
                 bootstrap_servers=list(settings.kafka_bootstrap_servers),
@@ -200,7 +212,9 @@ def create_kafka_producer(
                 exc,
                 backoff_seconds,
             )
-            sleep(backoff_seconds)
+            if not wait_before_retry(backoff_seconds, stop_event, sleep):
+                logger.info("stopped while waiting for Kafka at %s", servers)
+                return None
             attempt += 1
     logger.info("connected to Kafka at %s", servers)
     return producer

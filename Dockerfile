@@ -9,6 +9,10 @@
 # A model is trained at build time, so the image is self-contained: the detector works
 # without mounting anything. Mount your own model over /app/models (or point
 # NEURALGUARD_MODEL_PATH elsewhere) to use a different one.
+#
+# Live capture needs root inside the container (the image's user has no capabilities,
+# and --cap-add NET_RAW alone does not give it any) and the host's network:
+#   docker run --rm --user root --network host neuralguard produce --source live --interface eth0
 
 FROM python:3.12-slim
 
@@ -40,13 +44,19 @@ RUN pip install --no-cache-dir --no-deps . \
 
 # Train the model as root, so the runtime user can read it but not replace it
 # (the model is a joblib pickle; whoever can write it can run code in the detector).
-RUN neuralguard train --samples 40000 --output /app/models/threat_model.joblib \
+# Same settings as `neuralguard train`: a smaller training set misses attack variants.
+RUN neuralguard train --output /app/models/threat_model.joblib \
     && chmod 0755 /app/models \
     && chmod 0644 /app/models/*
 
 ENV NEURALGUARD_MODEL_PATH=/app/models/threat_model.joblib
 
 USER neuralguard:neuralguard
+
+# As PID 1 the CLI ignores signals it has no handler for, and it only installs its
+# SIGTERM handler once it starts: Python always handles SIGINT, so docker stop works
+# from the first moment (and is a graceful shutdown once the command runs).
+STOPSIGNAL SIGINT
 
 ENTRYPOINT ["neuralguard"]
 CMD ["detect"]

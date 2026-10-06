@@ -261,6 +261,57 @@ def test_a_far_future_timestamp_is_rejected_and_does_not_jump_the_window_clock()
     assert features_as_dict(after.features)["src_packet_count"] == 4.0
 
 
+def test_process_many_skips_a_record_that_breaks_validation_unexpectedly(monkeypatch, caplog):
+    import neuralguard.detector
+
+    def fragile(raw):
+        if raw.get("destination_port") == 666:
+            raise OverflowError("int too large to convert to float")
+        return normalize_record(raw)
+
+    monkeypatch.setattr(neuralguard.detector, "normalize_record", fragile)
+    detector = Detector(FakeModel())
+    with caplog.at_level(logging.WARNING, logger="neuralguard.detector"):
+        detections = detector.process_many([raw(dport=900), raw(dport=666), raw(dport=100)])
+    assert [d.record["destination_port"] for d in detections] == [900, 100]
+    assert (detector.stats.invalid, detector.stats.processed) == (1, 2)
+    assert "OverflowError: int too large" in caplog.text
+
+
+NOW = 1_800_000_000.0
+
+
+def test_records_dated_too_far_ahead_of_the_clock_are_rejected():
+    detector = Detector(FakeModel(window_seconds=10.0), max_future_skew=300.0, clock=lambda: NOW)
+    first = detector.process_many([raw(ts=NOW + i, dport=100) for i in range(3)])
+    assert features_as_dict(first[-1].features)["src_packet_count"] == 3.0
+    clock_before = detector.extractor._clock
+    # One record a day ahead, from unrelated hosts: before, it pinned the extractor's
+    # clock there and no window ever slid again.
+    future = raw(ts=NOW + 86_400, src="198.51.100.9", dst="198.51.100.10", dport=100)
+    assert detector.process_many([future]) == []
+    assert detector.stats.invalid == 1
+    assert detector.extractor._clock == clock_before
+    (later,) = detector.process_many([raw(ts=NOW + 62.0, dport=100)])
+    assert features_as_dict(later.features)["src_packet_count"] == 1.0  # the window slid
+    assert len(detector.process_many([raw(ts=NOW + 299.0, dport=100)])) == 1  # within skew
+    with pytest.raises(InvalidRecordError, match="ahead of this host's clock"):
+        detector.process(raw(ts=NOW + 301.0))
+    assert detector.stats.invalid == 2
+
+
+def test_without_a_skew_limit_future_records_are_accepted():
+    # Simulated traffic (demo, training) has its own time line.
+    detector = Detector(FakeModel(), clock=lambda: NOW)
+    assert len(detector.process_many([raw(ts=NOW + 86_400)])) == 1
+
+
+@pytest.mark.parametrize("skew", [-1.0, math.nan, math.inf])
+def test_invalid_max_future_skew(skew):
+    with pytest.raises(ValueError, match="max_future_skew"):
+        Detector(FakeModel(), max_future_skew=skew)
+
+
 def test_process_many_truncates_long_reasons(caplog):
     detector = Detector(FakeModel())
     with caplog.at_level(logging.WARNING, logger="neuralguard.detector"):

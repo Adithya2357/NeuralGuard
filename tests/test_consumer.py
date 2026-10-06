@@ -244,6 +244,26 @@ def test_handle_batch_counts_invalid_records_via_the_detector():
     assert service.detector.stats.processed == 1
 
 
+def test_a_huge_integer_timestamp_is_skipped_not_fatal():
+    # One crafted message used to raise OverflowError out of the loop, killing the
+    # detector and losing (committing) the rest of the poll.
+    poison = b'{"timestamp": 1' + b"0" * 400 + b', "source_ip": "10.0.0.1"}'
+    service = make_service()
+    service.handle_batch([encode(record()), poison, encode(record(dport=SSH))])
+    assert service.detector.stats.invalid == 1
+    assert service.detector.stats.processed == 2
+
+
+def test_records_with_an_ipv6_zone_id_raise_no_alert():
+    sink = FakeSink()
+    service = make_service(sinks=[sink])
+    forged = "fe80::bad%\n2026-10-06 12:00:00,000 INFO    neuralguard.consumer: stats\x1b]0;x\x07"
+    batch = [encode(record(dport=SSH, src=forged)), encode(record(dport=SSH, dst="fe80::1%lo"))]
+    assert service.handle_batch(batch) == 0
+    assert service.detector.stats.invalid == 2
+    assert sink.docs == []
+
+
 def test_handle_batch_only_undecodable_messages_does_not_call_the_detector():
     service = make_service()
 
@@ -413,7 +433,7 @@ def test_run_stops_after_max_messages_and_closes_everything():
     assert [poll["max_records"] for poll in consumer.polls] == [3, 1]
     assert all(poll["timeout_ms"] == 50 for poll in consumer.polls)
     assert consumer.closed
-    assert sink.closed and sink.flushes >= 1
+    assert sink.closed  # close() delivers what is still buffered
     assert len(sink.docs) == 1
 
 
@@ -494,7 +514,7 @@ def test_run_closes_sinks_and_consumer_when_the_loop_fails():
     consumer = BrokenConsumer()
     with pytest.raises(RuntimeError, match="poll failed"):
         service.run(consumer)
-    assert sinks[1].closed and sinks[1].flushes == 1
+    assert sinks[1].closed
     assert consumer.closed
 
 
@@ -510,6 +530,38 @@ def test_run_closes_everything_when_the_detector_fails():
     with pytest.raises(RuntimeError, match="model exploded"):
         service.run(consumer)
     assert sink.closed and consumer.closed
+
+
+def test_shutdown_tries_a_hanging_elasticsearch_only_once(monkeypatch):
+    # Each attempt against a host that drops packets waits for the request timeout;
+    # flush() then close() (which flushes again) doubled that before the consumer was
+    # closed, longer than docker stop waits before it kills the container.
+    import elastic_transport
+
+    import neuralguard.sinks
+    from neuralguard.sinks import ElasticsearchSink
+
+    attempts = []
+
+    def hanging_bulk(client, actions, **kwargs):
+        attempts.append(len(list(actions)))
+        raise elastic_transport.ConnectionTimeout("timed out")
+
+    class Client:
+        indices = type("Indices", (), {"exists": lambda self, index: True})()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(neuralguard.sinks, "bulk", hanging_bulk)
+    sink = ElasticsearchSink(["http://es:9200"], "alerts", client=Client(), batch_size=50)
+    service = make_service(sinks=[sink])
+    service.handle_batch([encode(record(ts=1_700_000_000.0 + i, dport=SSH)) for i in range(3)])
+    assert sink.buffered == 3 and attempts == []
+    consumer = FakeConsumer()
+    service.run(consumer, max_messages=0)
+    assert attempts == [3]  # one attempt at shutdown, not two
+    assert consumer.closed
 
 
 def test_run_survives_a_consumer_that_fails_to_close(caplog):
@@ -620,6 +672,21 @@ def test_create_kafka_consumer_zero_retries_tries_once():
     with pytest.raises(RETRYABLE[0]):
         create_kafka_consumer(SETTINGS, retries=0, consumer_factory=factory, sleep=sleeps.append)
     assert len(factory.calls) == 1 and sleeps == []
+
+
+def test_create_kafka_consumer_gives_up_when_stopped_while_waiting():
+    stop = threading.Event()
+    attempts = []
+
+    def factory(*args, **kwargs):
+        attempts.append(args)
+        stop.set()  # docker stop (SIGTERM) arrives during the first attempt
+        raise RETRYABLE[0]("no brokers")
+
+    assert create_kafka_consumer(SETTINGS, consumer_factory=factory, stop_event=stop) is None
+    assert len(attempts) == 1  # not 11 attempts, about a minute, before stopping
+    assert create_kafka_consumer(SETTINGS, consumer_factory=factory, stop_event=stop) is None
+    assert len(attempts) == 1  # already stopped: no attempt at all
 
 
 def test_create_kafka_consumer_does_not_retry_other_errors():
