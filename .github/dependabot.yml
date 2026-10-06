@@ -10,9 +10,11 @@ updates:
       dev-tools:
         patterns: ["pytest*", "ruff", "bandit", "pip-audit"]
     ignore:
-      # The code uses the 8.x client API (pyproject pins elasticsearch<9).
+      # The code uses the 8.x client API (pyproject pins elasticsearch<9), and a 9.x client
+      # cannot talk to the Elasticsearch 8 server in docker-compose.yml. update-types alone
+      # did not stop a range-widening PR (<9 -> <10), so ignore those versions explicitly.
       - dependency-name: elasticsearch
-        update-types: ["version-update:semver-major"]
+        versions: [">=9"]
 
   - package-ecosystem: github-actions
     directory: "/"
