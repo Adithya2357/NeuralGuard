@@ -1,0 +1,32 @@
+# Keep the build context small and free of secrets: only what the Dockerfile COPYs.
+# (If you add a COPY to the Dockerfile, re-include the file here.)
+**
+!Dockerfile
+!pyproject.toml
+!requirements.txt
+!README.md
+!LICENSE
+!neuralguard/
+!neuralguard/**
+
+# Never send these, even from inside re-included directories.
+.git
+.github
+.venv
+venv
+neuralguard-env
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+build
+dist
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+models/*.joblib
+models/*.sha256
+**/*.jsonl
+tests
+.env
