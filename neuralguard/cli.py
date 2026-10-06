@@ -21,6 +21,7 @@ inside the commands, so ``neuralguard --help`` stays fast.
 from __future__ import annotations
 
 import argparse
+import errno
 import itertools
 import json
 import logging
@@ -46,7 +47,14 @@ EXIT_FAILURE = 1
 EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130
 
-DEMO_TRAIN_SAMPLES = 20_000
+# The demo's default stream: long enough that seed 7 shows an episode of every attack
+# type (the simulator cycles through all of them; see tests/test_cli.py).
+DEMO_COUNT = 6000
+DEMO_SEED = 7
+# The fallback in-memory model sees as much simulated traffic as `neuralguard train`
+# (with fewer trees): about 20k records cover only ~4 episodes per attack type, too few
+# to have seen every variant, and whole unseen variants then go undetected.
+DEMO_TRAIN_SAMPLES = 60_000
 DEMO_TRAIN_TREES = 100
 _DEMO_BATCH_SIZE = 500
 
@@ -183,8 +191,8 @@ def _add_produce(commands: Any) -> None:
     live.add_argument(
         "--bpf-filter",
         metavar="FILTER",
-        help="BPF capture filter (default: exclude NeuralGuard's own Kafka and "
-        "Elasticsearch traffic)",
+        help="BPF capture filter, needs libpcap; '' = capture everything (default: exclude "
+        "NeuralGuard's own Kafka and Elasticsearch traffic, which works without libpcap)",
     )
     pcap = sub.add_argument_group("pcap options")
     pcap.add_argument("--pcap", type=Path, metavar="FILE", help="pcap/pcapng file to read")
@@ -243,11 +251,13 @@ def _add_demo(commands: Any) -> None:
     sub.add_argument(
         "--count",
         type=_positive_int,
-        default=3000,
+        default=DEMO_COUNT,
         metavar="N",
-        help="simulated packets (default: %(default)s)",
+        help="simulated packets (default: %(default)s: every attack type with the default seed)",
     )
-    sub.add_argument("--seed", type=int, default=7, help="simulator seed (default: %(default)s)")
+    sub.add_argument(
+        "--seed", type=int, default=DEMO_SEED, help="simulator seed (default: %(default)s)"
+    )
     sub.add_argument(
         "--attack-ratio",
         type=_fraction,
@@ -338,6 +348,9 @@ def _fail(exc: BaseException, status: int) -> int:
 
 
 def _describe(exc: BaseException) -> str:
+    if isinstance(exc, FileExistsError) and exc.filename and not Path(exc.filename).is_dir():
+        # mkdir(parents=True, exist_ok=True) raises this only when a *file* is in the way.
+        return f"Not a directory: {exc.filename}"
     if isinstance(exc, OSError) and exc.strerror:
         text = f"{exc.strerror}: {exc.filename}" if exc.filename else exc.strerror
     else:
@@ -375,10 +388,15 @@ def _silence_stdout() -> None:
 
 
 def _cmd_train(args: argparse.Namespace, settings: Settings) -> int:
+    settings = settings.with_overrides(window_seconds=args.window, model_path=args.output)
+    # Training can take a while: find out now, not afterwards, that a file can't be written.
+    _check_output_path(settings.model_path)
+    if args.report_json is not None:
+        _check_output_path(args.report_json)
+
     from neuralguard.model import checksum_path
     from neuralguard.train import format_report, train_model
 
-    settings = settings.with_overrides(window_seconds=args.window, model_path=args.output)
     result = train_model(
         n_samples=args.samples,
         seed=args.seed,
@@ -422,6 +440,9 @@ def _cmd_produce(args: argparse.Namespace, settings: Settings) -> int:
         kafka_bootstrap_servers=_csv(args.bootstrap_servers), kafka_topic=args.topic
     )
     stop_event = threading.Event()
+    # The source first: a bad --pcap must fail before --output is truncated (or before
+    # waiting for Kafka). Live capture only starts sniffing once iterated.
+    records = _record_source(args, settings, stop_event)
     if args.output is not None:
         sink: Any = JsonlRecordSink(args.output)
         destination = "stdout" if args.output == "-" else args.output
@@ -429,7 +450,6 @@ def _cmd_produce(args: argparse.Namespace, settings: Settings) -> int:
         sink = KafkaRecordSink(create_kafka_producer(settings), settings.kafka_topic)
         destination = f"Kafka topic {settings.kafka_topic!r}"
     try:
-        records = _record_source(args, settings, stop_event)
         install_signal_handlers(stop_event)
         pace = args.source == "simulate" and not args.no_pace
         logger.info("publishing %s records to %s", args.source, destination)
@@ -466,13 +486,19 @@ def _record_source(
     from neuralguard import capture
 
     if args.source == "live":
-        bpf_filter = args.bpf_filter or capture.default_bpf_filter(settings)
-        logger.info("capturing on %s with filter %r", args.interface or "default", bpf_filter)
+        if args.bpf_filter is None:  # default: keep NeuralGuard's own traffic out
+            bpf_filter, excluded = None, capture.default_excluded_ports(settings)
+            what = "excluding TCP ports " + ", ".join(map(str, excluded))
+        else:  # a filter of the user's own ('' = capture everything)
+            bpf_filter, excluded = args.bpf_filter or None, ()
+            what = f"with filter {bpf_filter!r}" if bpf_filter else "without a filter"
+        logger.info("capturing on %s %s", args.interface or "the default interface", what)
         return capture.live_records(
             interface=args.interface,
             bpf_filter=bpf_filter,
             count=args.count,
             stop_event=stop_event,
+            exclude_tcp_ports=excluded,
         )
     return itertools.islice(capture.pcap_records(args.pcap), limit)
 
@@ -571,6 +597,7 @@ def _cmd_demo(args: argparse.Namespace, settings: Settings) -> int:
             detections = detector.process_many(batch)
             summary.add(detections)
             service.emit_alerts(detections)
+        service.flush_alerts()  # what throttling still holds back at the end
     finally:
         _close_quietly(console)
     summary.alerts_emitted = service.alerts_emitted
@@ -683,6 +710,12 @@ class DemoSummary:
         lines += ["", "Overall:"]
         lines += [f"  {name + ':':<{width + 1}}  {value}" for name, value in overall]
         lines.append("")
+        missing = [label for label in ATTACK_TYPES if label not in self.by_label]
+        if attacks and missing:  # the simulator cycles through every type over time
+            lines.append(
+                f"Not in this run: {', '.join(missing)} - a longer run (--count) "
+                "includes every attack type."
+            )
         lines.append(
             "'Correct attack type' counts flagged packets whose predicted attack type "
             "matches the true label."
@@ -734,6 +767,20 @@ def _close_quietly(resource: Any) -> None:
 
 def _sink_name(sink: Any) -> str:
     return type(sink).__name__.removesuffix("Sink").lower() or type(sink).__name__
+
+
+def _check_output_path(path: Path) -> None:
+    """Raise ``OSError`` if ``path`` clearly cannot be written: it is a directory, or its
+    nearest existing ancestor is not a writable directory. Nothing is created."""
+    if path.is_dir():
+        raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), str(path))
+    ancestor = path.parent
+    while not ancestor.exists() and ancestor != ancestor.parent:
+        ancestor = ancestor.parent
+    if not ancestor.is_dir():
+        raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(ancestor))
+    if not os.access(ancestor, os.W_OK | os.X_OK):
+        raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(ancestor))
 
 
 def _write_json(path: Path, payload: Any) -> None:

@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from neuralguard.schema import InvalidRecordError, normalize_record
+from neuralguard.schema import MAX_TIMESTAMP, InvalidRecordError, normalize_record
 
 
 def test_full_record_round_trips():
@@ -78,3 +78,24 @@ def test_non_mapping_raises():
 
 def test_integral_floats_are_accepted():
     assert normalize_record({"length": 60.0})["length"] == 60
+
+
+@pytest.mark.parametrize("timestamp", [1e20, 1e300, MAX_TIMESTAMP + 1, 1_700_000_000_000])
+def test_implausible_timestamps_are_rejected(timestamp):
+    # Past the year 3000 a timestamp is corrupt or mis-scaled; it would otherwise jump the
+    # feature extractor's forward-only clock far into the future for good.
+    with pytest.raises(InvalidRecordError, match="not a plausible capture time"):
+        normalize_record({"timestamp": timestamp})
+
+
+def test_millisecond_timestamps_get_a_hint():
+    with pytest.raises(InvalidRecordError, match="milliseconds instead of seconds"):
+        normalize_record({"timestamp": 1_700_000_000_123})
+    with pytest.raises(InvalidRecordError) as excinfo:
+        normalize_record({"timestamp": 1e20})
+    assert "milliseconds" not in str(excinfo.value)
+
+
+def test_timestamp_bounds_are_inclusive():
+    assert normalize_record({"timestamp": 0})["timestamp"] == 0.0
+    assert normalize_record({"timestamp": MAX_TIMESTAMP})["timestamp"] == MAX_TIMESTAMP

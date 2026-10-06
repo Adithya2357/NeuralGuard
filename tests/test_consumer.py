@@ -7,6 +7,7 @@ import logging
 import signal
 import threading
 from dataclasses import dataclass
+from typing import ClassVar
 
 import kafka.errors
 import numpy as np
@@ -23,6 +24,7 @@ from neuralguard.consumer import (
 )
 from neuralguard.detector import Detector, DetectorStats
 from neuralguard.features import FEATURE_NAMES
+from neuralguard.kafkautil import BOOTSTRAP_TIMEOUT_MS
 from neuralguard.model import Prediction
 
 DST_PORT = FEATURE_NAMES.index("destination_port")
@@ -131,6 +133,9 @@ class FakeThrottler:
             self.suppressed_total += 1
             return None
         return 0
+
+    def flush(self, now=None, *, everything=False):
+        return []
 
 
 class FakeClock:
@@ -308,6 +313,33 @@ def test_real_throttler_passes_the_suppressed_count_on():
     batch = [encode(record(ts=t0 + i, dport=SSH)) for i in (0.0, 1.0, 2.0, 6.0)]
     assert service.handle_batch(batch) == 2
     assert [doc["suppressed_count"] for doc in sink.docs] == [0, 2]
+
+
+def test_held_back_alerts_are_summarised_when_the_target_goes_quiet():
+    sink = FakeSink()
+    service = make_service(sinks=[sink], throttler=AlertThrottler(cooldown_seconds=5.0))
+    t0 = 1_700_000_000.0
+    flood = [encode(record(ts=t0 + i * 0.1, dport=SSH)) for i in range(10)]
+    assert service.handle_batch(flood) == 1
+    assert [doc["suppressed_count"] for doc in sink.docs] == [0]
+    # Only normal traffic afterwards: once the cooldown is over (by packet time), the
+    # held-back tail is reported on the latest suppressed packet.
+    assert service.handle_batch([encode(record(ts=t0 + 3.0, dport=80))]) == 0
+    assert service.handle_batch([encode(record(ts=t0 + 6.0, dport=80))]) == 1
+    assert [doc["suppressed_count"] for doc in sink.docs] == [0, 8]
+    assert sink.docs[-1]["@timestamp"].startswith("2023-11-14T22:13:20.9")  # t0 + 0.9
+    assert service.alerts_emitted == 2
+    assert sum(1 + doc["suppressed_count"] for doc in sink.docs) == 10
+
+
+def test_run_reports_held_back_alerts_before_closing_the_sinks():
+    sink = FakeSink()
+    service = make_service(sinks=[sink], throttler=AlertThrottler(cooldown_seconds=60.0))
+    flood = [record(ts=1_700_000_000.0 + i, dport=SSH) for i in range(5)]
+    service.run(FakeConsumer([{partition(0): messages(*flood)}]), max_messages=5)
+    assert [doc["suppressed_count"] for doc in sink.docs] == [0, 3]
+    assert sink.closed
+    assert service.alerts_emitted == 2
 
 
 # ------------------------------------------------------------------------------ tick
@@ -545,6 +577,16 @@ def test_create_kafka_consumer_configuration():
         "enable_auto_commit": True,
     }
     assert "value_deserializer" not in kwargs
+
+
+def test_create_kafka_consumer_bounds_each_bootstrap_attempt_on_kafka_python_3():
+    class Kafka3Consumer(FlakyFactory):
+        DEFAULT_CONFIG: ClassVar[dict] = {"group_id": None, "bootstrap_timeout_ms": 30000}
+
+    factory = Kafka3Consumer(0, RuntimeError)
+    create_kafka_consumer(SETTINGS, consumer_factory=factory)
+    ((_, kwargs),) = factory.calls
+    assert kwargs["bootstrap_timeout_ms"] == BOOTSTRAP_TIMEOUT_MS
 
 
 @pytest.mark.parametrize("error", RETRYABLE, ids=lambda cls: cls.__name__)

@@ -28,6 +28,7 @@ files.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import hmac
 import io
@@ -290,6 +291,8 @@ class ThreatModel:
         Parent directories are created. Returns the path written.
         """
         path = Path(path)
+        if path.is_dir():  # else os.replace() fails naming the temporary file
+            raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), str(path))
         path.parent.mkdir(parents=True, exist_ok=True)
         metadata = {
             **self.metadata,

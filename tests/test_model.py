@@ -383,6 +383,17 @@ def test_save_writes_bundle_and_sha256sum_sidecar(trained, tmp_path):
     )
 
 
+def test_save_into_a_directory_names_the_directory(trained, tmp_path):
+    target = tmp_path / "models"
+    target.mkdir()
+    version = trained.version
+    with pytest.raises(IsADirectoryError) as excinfo:
+        trained.save(target)
+    assert excinfo.value.filename == str(target)
+    assert list(target.iterdir()) == []  # no temporary file left behind
+    assert trained.version == version
+
+
 def test_save_load_round_trip(trained, dataset, tmp_path):
     X, _ = dataset
     path = trained.save(tmp_path / "model.joblib")

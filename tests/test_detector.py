@@ -249,6 +249,18 @@ def test_process_many_skips_invalid_records(caplog):
     assert "record must be a JSON object" in warnings[1].getMessage()
 
 
+def test_a_far_future_timestamp_is_rejected_and_does_not_jump_the_window_clock():
+    detector = Detector(FakeModel(window_seconds=10.0))
+    before = detector.process_many([raw(ts=1_700_000_000.0 + i, dport=100) for i in range(3)])
+    assert features_as_dict(before[-1].features)["src_packet_count"] == 3.0
+    poisoned = detector.process_many([raw(ts=1e20, dport=100)])
+    assert poisoned == [] and detector.stats.invalid == 1
+    # Had 1e20 been accepted, the extractor's clock would sit at 1e20 for good and the
+    # earlier packets would have dropped out of every later window.
+    (after,) = detector.process_many([raw(ts=1_700_000_003.0, dport=100)])
+    assert features_as_dict(after.features)["src_packet_count"] == 4.0
+
+
 def test_process_many_truncates_long_reasons(caplog):
     detector = Detector(FakeModel())
     with caplog.at_level(logging.WARNING, logger="neuralguard.detector"):

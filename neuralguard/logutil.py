@@ -44,6 +44,9 @@ def configure_logging(level: str = "INFO", fmt: str = "text") -> None:
     except ValueError:
         root.setLevel(logging.INFO)
         root.warning("unknown log level %r, using INFO", level)
-    # Third-party clients are chatty at INFO.
-    for noisy in ("kafka", "elastic_transport", "elasticsearch", "scapy.runtime"):
+    # Third-party clients are chatty at INFO. elastic_transport even logs every internal
+    # retry with a full traceback at WARNING; while Elasticsearch is down,
+    # ElasticsearchSink already reports that (once a minute).
+    for noisy in ("kafka", "elasticsearch", "scapy.runtime"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    logging.getLogger("elastic_transport").setLevel(logging.ERROR)
